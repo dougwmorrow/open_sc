@@ -1,1348 +1,624 @@
-# Below is python
+#!/usr/bin/env python3
+"""
+File Statistics Tracker with SQL Server SCD2 Implementation
+Analyzes all files in a directory and maintains historical tracking using SCD2 methodology
+in SQL Server database.
+"""
+
+import os
+import stat
+import pwd
+import grp
+import hashlib
+import mimetypes
+from pathlib import Path
+from datetime import datetime, timezone
 import pandas as pd
+import platform
+import subprocess
+import sys
+from typing import Dict, List, Optional, Tuple
+import sqlalchemy as sa
+from sqlalchemy import create_engine, text, MetaData, Table, Column, Integer, String, DateTime, Boolean, Float, BigInteger
+from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
+import pyodbc
+import uuid
+import json
+from dataclasses import dataclass, asdict
 
-# Create comprehensive data for ALL solutions (local + enterprise)
-all_solutions_data = {
-    'Solution Name': [
-        # Local Solutions
-        'OS Keyring (Python keyring)',
-        'Windows Credential Manager',
-        'macOS Keychain',
-        'Linux Secret Service',
-        'KeePass/KeePassXC',
-        'HashiCorp Vault (Dev Mode)',
-        'Custom Encrypted Storage',
-        'Python Cryptography + Argon2',
-        # Enterprise Solutions
-        'HashiCorp Vault Enterprise',
-        'CyberArk PAS',
-        'Thycotic/Delinea Secret Server',
-        'BeyondTrust Password Safe',
-        'Akeyless Vault Platform',
-        'Thales Luna HSM',
-        'Entrust nShield HSM',
-        'AWS CloudHSM',
-        'Venafi Trust Protection Platform',
-        'Microsoft AD Certificate Services'
-    ],
+@dataclass
+class DatabaseConfig:
+    """Database connection configuration"""
+    server: str
+    database: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+    driver: str = "ODBC Driver 17 for SQL Server"
+    trusted_connection: bool = True
+
+class FileStatsTracker:
+    """Main class for file statistics tracking with SCD2 implementation"""
     
-    '🏠/🏢': [
-        '🏠', '🏠', '🏠', '🏠', '🏠', '🏠', '🏠', '🏠',
-        '🏢', '🏢', '🏢', '🏢', '🏢', '🏢', '🏢', '🏢', '🏢', '🏢'
-    ],
+    def __init__(self, db_config: DatabaseConfig):
+        self.db_config = db_config
+        self.engine = self._create_connection()
+        self.metadata = MetaData()
+        self._create_tables()
     
-    'Category': [
-        # Local
-        'OS Credential Store',
-        'OS Credential Store',
-        'OS Credential Store',
-        'OS Credential Store',
-        'Local Password Manager',
-        'Local Password Vault',
-        'Custom Solution',
-        'Encryption Library',
-        # Enterprise
-        'Enterprise Password Vault',
-        'Enterprise Password Vault',
-        'Enterprise Password Vault',
-        'Enterprise Password Vault',
-        'Enterprise Password Vault',
-        'Hardware Security Module',
-        'Hardware Security Module',
-        'Hardware Security Module',
-        'Certificate Management',
-        'Certificate Management'
-    ],
+    def _create_connection(self):
+        """Create SQLAlchemy engine for SQL Server"""
+        if self.db_config.trusted_connection:
+            connection_string = (
+                f"mssql+pyodbc://@{self.db_config.server}/{self.db_config.database}"
+                f"?driver={self.db_config.driver.replace(' ', '+')}&trusted_connection=yes"
+            )
+        else:
+            connection_string = (
+                f"mssql+pyodbc://{self.db_config.username}:{self.db_config.password}"
+                f"@{self.db_config.server}/{self.db_config.database}"
+                f"?driver={self.db_config.driver.replace(' ', '+')}"
+            )
+        
+        return create_engine(connection_string, echo=False)
     
-    'Type': [
-        'Local', 'Local', 'Local', 'Local', 'Local', 'Local', 'Local', 'Local',
-        'Enterprise', 'Enterprise', 'Enterprise', 'Enterprise', 'Enterprise', 
-        'Enterprise', 'Enterprise', 'Enterprise', 'Enterprise', 'Enterprise'
-    ],
+    def _create_tables(self):
+        """Create database tables if they don't exist"""
+        
+        # Main file statistics table with SCD2 structure
+        self.file_stats_table = Table(
+            'file_statistics_history',
+            self.metadata,
+            Column('surrogate_key', Integer, primary_key=True, autoincrement=True),
+            Column('file_path', String(2000), nullable=False),  # Natural key
+            Column('file_name', String(500)),
+            Column('file_extension', String(50)),
+            Column('directory_path', String(2000)),
+            Column('is_file', Boolean),
+            Column('is_directory', Boolean),
+            Column('is_symlink', Boolean),
+            Column('size_bytes', BigInteger),
+            Column('size_kb', Float),
+            Column('size_mb', Float),
+            Column('mime_type', String(200)),
+            Column('created_timestamp', Float),
+            Column('modified_timestamp', Float),
+            Column('accessed_timestamp', Float),
+            Column('created_datetime', DateTime),
+            Column('modified_datetime', DateTime),
+            Column('accessed_datetime', DateTime),
+            Column('owner_uid', Integer),
+            Column('owner_name', String(100)),
+            Column('group_gid', Integer),
+            Column('group_name', String(100)),
+            Column('permissions', String(20)),
+            Column('mode', String(20)),
+            Column('inode', BigInteger),
+            Column('device_id', BigInteger),
+            Column('hard_links', Integer),
+            Column('md5_hash', String(32)),
+            Column('last_accessed_user', String(100)),
+            
+            # SCD2 specific columns
+            Column('effective_date', DateTime, nullable=False),
+            Column('end_date', DateTime, nullable=True),
+            Column('is_current', Boolean, nullable=False, default=True),
+            Column('record_created_date', DateTime, nullable=False, default=datetime.utcnow),
+            Column('record_created_by', String(100), nullable=False, default='system'),
+            Column('change_reason', String(500)),
+            Column('scan_id', UNIQUEIDENTIFIER, nullable=False),
+            
+            # Computed columns for easier querying
+            Column('age_days', Integer),
+            Column('last_modified_days_ago', Integer),
+            Column('last_accessed_days_ago', Integer)
+        )
+        
+        # Scan metadata table
+        self.scan_metadata_table = Table(
+            'scan_metadata',
+            self.metadata,
+            Column('scan_id', UNIQUEIDENTIFIER, primary_key=True),
+            Column('scan_start_time', DateTime, nullable=False),
+            Column('scan_end_time', DateTime),
+            Column('directory_scanned', String(2000), nullable=False),
+            Column('recursive_scan', Boolean, nullable=False),
+            Column('include_hidden', Boolean, nullable=False),
+            Column('total_files_found', Integer),
+            Column('total_files_analyzed', Integer),
+            Column('total_errors', Integer),
+            Column('scan_status', String(50)),  # 'running', 'completed', 'failed'
+            Column('error_message', String(2000))
+        )
+        
+        # Create tables
+        self.metadata.create_all(self.engine)
+        print("Database tables created/verified successfully")
     
-    'Local/Enterprise': [
-        'Local - Built-in OS',
-        'Local - Built-in OS',
-        'Local - Built-in OS',
-        'Local - Built-in OS',
-        'Local - Standalone App',
-        'Local - Self-hosted',
-        'Local - Custom Code',
-        'Local - Custom Code',
-        'Enterprise - On-Prem/Cloud',
-        'Enterprise - On-Prem/Cloud',
-        'Enterprise - On-Prem/Cloud',
-        'Enterprise - On-Prem/Cloud',
-        'Enterprise - Cloud-First',
-        'Enterprise - Hardware',
-        'Enterprise - Hardware',
-        'Enterprise - Cloud Only',
-        'Enterprise - On-Prem/Cloud',
-        'Enterprise - On-Prem'
-    ],
+    def get_file_hash(self, file_path, hash_type='md5'):
+        """Calculate file hash (MD5 by default)"""
+        try:
+            hash_obj = hashlib.new(hash_type)
+            with open(file_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_obj.update(chunk)
+            return hash_obj.hexdigest()
+        except (IOError, OSError):
+            return None
+
+    def get_user_name(self, uid):
+        """Get username from UID"""
+        try:
+            return pwd.getpwuid(uid).pw_name
+        except (KeyError, AttributeError):
+            return f"UID:{uid}"
+
+    def get_group_name(self, gid):
+        """Get group name from GID"""
+        try:
+            return grp.getgrgid(gid).gr_name
+        except (KeyError, AttributeError):
+            return f"GID:{gid}"
+
+    def get_file_permissions(self, mode):
+        """Convert file mode to readable permissions string"""
+        return stat.filemode(mode)
+
+    def get_mime_type(self, file_path):
+        """Get MIME type of file"""
+        mime_type, _ = mimetypes.guess_type(file_path)
+        return mime_type or 'unknown'
+
+    def get_last_accessed_user(self, file_path):
+        """Attempt to get the last user who accessed the file"""
+        try:
+            if platform.system() == "Linux":
+                result = subprocess.run(['lsof', str(file_path)], 
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode == 0 and result.stdout:
+                    lines = result.stdout.strip().split('\n')
+                    if len(lines) > 1:
+                        return lines[1].split()[2]
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+            pass
+        return "Unknown"
+
+    def analyze_file(self, file_path: Path, scan_id: str) -> Dict:
+        """Analyze a single file and return its statistics"""
+        try:
+            file_stat = file_path.stat()
+            current_time = datetime.utcnow()
+            
+            # Basic file information
+            file_info = {
+                'file_path': str(file_path.absolute()),
+                'file_name': file_path.name,
+                'file_extension': file_path.suffix.lower(),
+                'directory_path': str(file_path.parent),
+                'is_file': file_path.is_file(),
+                'is_directory': file_path.is_dir(),
+                'is_symlink': file_path.is_symlink(),
+            }
+            
+            # File size and type
+            file_info.update({
+                'size_bytes': file_stat.st_size,
+                'size_kb': round(file_stat.st_size / 1024, 2),
+                'size_mb': round(file_stat.st_size / (1024 * 1024), 2),
+                'mime_type': self.get_mime_type(file_path),
+            })
+            
+            # Timestamps
+            created_dt = datetime.fromtimestamp(file_stat.st_ctime)
+            modified_dt = datetime.fromtimestamp(file_stat.st_mtime)
+            accessed_dt = datetime.fromtimestamp(file_stat.st_atime)
+            
+            file_info.update({
+                'created_timestamp': file_stat.st_ctime,
+                'modified_timestamp': file_stat.st_mtime,
+                'accessed_timestamp': file_stat.st_atime,
+                'created_datetime': created_dt,
+                'modified_datetime': modified_dt,
+                'accessed_datetime': accessed_dt,
+            })
+            
+            # Ownership and permissions
+            file_info.update({
+                'owner_uid': file_stat.st_uid,
+                'owner_name': self.get_user_name(file_stat.st_uid),
+                'group_gid': file_stat.st_gid,
+                'group_name': self.get_group_name(file_stat.st_gid),
+                'permissions': self.get_file_permissions(file_stat.st_mode),
+                'mode': oct(file_stat.st_mode),
+            })
+            
+            # Advanced metadata
+            file_info.update({
+                'inode': file_stat.st_ino,
+                'device_id': file_stat.st_dev,
+                'hard_links': file_stat.st_nlink,
+            })
+            
+            # File hash (only for regular files to avoid errors)
+            if file_path.is_file() and file_stat.st_size < 100 * 1024 * 1024:
+                file_info['md5_hash'] = self.get_file_hash(file_path)
+            else:
+                file_info['md5_hash'] = None
+                
+            # Last accessed user
+            file_info['last_accessed_user'] = self.get_last_accessed_user(file_path)
+            
+            # SCD2 fields
+            file_info.update({
+                'effective_date': current_time,
+                'end_date': None,
+                'is_current': True,
+                'record_created_date': current_time,
+                'record_created_by': 'file_tracker_system',
+                'scan_id': scan_id
+            })
+            
+            # Computed fields
+            file_info.update({
+                'age_days': (current_time - created_dt).days,
+                'last_modified_days_ago': (current_time - modified_dt).days,
+                'last_accessed_days_ago': (current_time - accessed_dt).days,
+            })
+            
+            return file_info
+            
+        except (OSError, IOError, PermissionError) as e:
+            return {
+                'file_path': str(file_path.absolute()),
+                'file_name': file_path.name,
+                'error': str(e),
+                'analyzable': False,
+                'scan_id': scan_id
+            }
+
+    def get_current_records(self) -> pd.DataFrame:
+        """Get all current records from the database"""
+        query = text("""
+            SELECT file_path, size_bytes, modified_timestamp, md5_hash, 
+                   permissions, owner_name, group_name, surrogate_key
+            FROM file_statistics_history 
+            WHERE is_current = 1
+        """)
+        
+        with self.engine.connect() as conn:
+            return pd.read_sql(query, conn)
+
+    def detect_changes(self, new_record: Dict, existing_record: pd.Series) -> Tuple[bool, List[str]]:
+        """Detect if a file has changed and what changed"""
+        changes = []
+        
+        # Key fields to monitor for changes
+        comparison_fields = {
+            'size_bytes': 'File size',
+            'modified_timestamp': 'Last modified time',
+            'md5_hash': 'File content (hash)',
+            'permissions': 'File permissions',
+            'owner_name': 'File owner',
+            'group_name': 'File group'
+        }
+        
+        for field, description in comparison_fields.items():
+            new_value = new_record.get(field)
+            old_value = existing_record.get(field)
+            
+            if new_value != old_value:
+                changes.append(f"{description} changed from '{old_value}' to '{new_value}'")
+        
+        return len(changes) > 0, changes
+
+    def close_current_record(self, surrogate_key: int, end_date: datetime, change_reason: str):
+        """Close (expire) the current record by setting end_date and is_current=False"""
+        update_query = text("""
+            UPDATE file_statistics_history 
+            SET end_date = :end_date, 
+                is_current = 0,
+                change_reason = :change_reason
+            WHERE surrogate_key = :surrogate_key
+        """)
+        
+        with self.engine.connect() as conn:
+            conn.execute(update_query, {
+                'end_date': end_date,
+                'change_reason': change_reason,
+                'surrogate_key': surrogate_key
+            })
+            conn.commit()
+
+    def insert_new_record(self, record: Dict):
+        """Insert a new record into the database"""
+        # Remove any fields that don't exist in the table
+        table_columns = [col.name for col in self.file_stats_table.columns]
+        filtered_record = {k: v for k, v in record.items() if k in table_columns}
+        
+        with self.engine.connect() as conn:
+            conn.execute(self.file_stats_table.insert(), filtered_record)
+            conn.commit()
+
+    def process_scd2_updates(self, new_records: List[Dict], scan_id: str):
+        """Process SCD2 updates for all new records"""
+        current_records_df = self.get_current_records()
+        current_time = datetime.utcnow()
+        
+        stats = {
+            'new_files': 0,
+            'updated_files': 0,
+            'unchanged_files': 0,
+            'deleted_files': 0
+        }
+        
+        # Create lookup dictionary for existing records
+        existing_lookup = {}
+        if not current_records_df.empty:
+            for _, row in current_records_df.iterrows():
+                existing_lookup[row['file_path']] = row
+        
+        # Process new/updated records
+        new_file_paths = set()
+        for record in new_records:
+            if 'error' in record:  # Skip error records
+                continue
+                
+            file_path = record['file_path']
+            new_file_paths.add(file_path)
+            
+            if file_path in existing_lookup:
+                # File exists, check for changes
+                existing_record = existing_lookup[file_path]
+                has_changed, changes = self.detect_changes(record, existing_record)
+                
+                if has_changed:
+                    # Close current record
+                    change_reason = "; ".join(changes)
+                    self.close_current_record(
+                        existing_record['surrogate_key'], 
+                        current_time, 
+                        change_reason
+                    )
+                    
+                    # Insert new record
+                    record['change_reason'] = f"Updated: {change_reason}"
+                    self.insert_new_record(record)
+                    stats['updated_files'] += 1
+                    print(f"Updated: {file_path}")
+                else:
+                    stats['unchanged_files'] += 1
+            else:
+                # New file
+                record['change_reason'] = "New file discovered"
+                self.insert_new_record(record)
+                stats['new_files'] += 1
+                print(f"New file: {file_path}")
+        
+        # Handle deleted files (existed before but not in current scan)
+        if not current_records_df.empty:
+            existing_file_paths = set(current_records_df['file_path'])
+            deleted_paths = existing_file_paths - new_file_paths
+            
+            for deleted_path in deleted_paths:
+                existing_record = existing_lookup[deleted_path]
+                self.close_current_record(
+                    existing_record['surrogate_key'],
+                    current_time,
+                    "File deleted or no longer accessible"
+                )
+                stats['deleted_files'] += 1
+                print(f"Deleted: {deleted_path}")
+        
+        return stats
+
+    def create_scan_record(self, directory_path: str, recursive: bool, include_hidden: bool) -> str:
+        """Create a new scan record and return scan_id"""
+        scan_id = str(uuid.uuid4())
+        scan_record = {
+            'scan_id': scan_id,
+            'scan_start_time': datetime.utcnow(),
+            'directory_scanned': directory_path,
+            'recursive_scan': recursive,
+            'include_hidden': include_hidden,
+            'scan_status': 'running'
+        }
+        
+        with self.engine.connect() as conn:
+            conn.execute(self.scan_metadata_table.insert(), scan_record)
+            conn.commit()
+        
+        return scan_id
+
+    def update_scan_record(self, scan_id: str, **updates):
+        """Update scan record with completion information"""
+        update_query = text(f"""
+            UPDATE scan_metadata 
+            SET {', '.join([f"{k} = :{k}" for k in updates.keys()])}
+            WHERE scan_id = :scan_id
+        """)
+        
+        updates['scan_id'] = scan_id
+        with self.engine.connect() as conn:
+            conn.execute(update_query, updates)
+            conn.commit()
+
+    def scan_directory(self, directory_path: str, recursive: bool = True, include_hidden: bool = False):
+        """Main method to scan directory and update database with SCD2 tracking"""
+        directory = Path(directory_path)
+        
+        if not directory.exists():
+            raise FileNotFoundError(f"Directory not found: {directory_path}")
+        
+        if not directory.is_dir():
+            raise NotADirectoryError(f"Path is not a directory: {directory_path}")
+        
+        # Create scan record
+        scan_id = self.create_scan_record(str(directory.absolute()), recursive, include_hidden)
+        
+        try:
+            print(f"Starting scan: {scan_id}")
+            print(f"Directory: {directory.absolute()}")
+            print(f"Recursive: {recursive}, Include hidden: {include_hidden}")
+            
+            # Collect files to analyze
+            if recursive:
+                files = directory.rglob("*")
+            else:
+                files = directory.iterdir()
+            
+            # Filter hidden files if needed
+            if not include_hidden:
+                files = [f for f in files if not any(part.startswith('.') 
+                        for part in f.parts[len(directory.parts):])]
+            
+            # Analyze all files
+            file_data = []
+            total_files = 0
+            analyzed_files = 0
+            error_count = 0
+            
+            for file_path in files:
+                total_files += 1
+                if total_files % 100 == 0:
+                    print(f"Processed {total_files} files...")
+                
+                file_info = self.analyze_file(file_path, scan_id)
+                file_data.append(file_info)
+                
+                if file_info.get('analyzable', True):
+                    analyzed_files += 1
+                else:
+                    error_count += 1
+            
+            print(f"\nProcessing SCD2 updates...")
+            scd2_stats = self.process_scd2_updates(file_data, scan_id)
+            
+            # Update scan record with completion information
+            self.update_scan_record(
+                scan_id,
+                scan_end_time=datetime.utcnow(),
+                total_files_found=total_files,
+                total_files_analyzed=analyzed_files,
+                total_errors=error_count,
+                scan_status='completed'
+            )
+            
+            print(f"\nScan completed successfully!")
+            print(f"Scan ID: {scan_id}")
+            print(f"Total files found: {total_files}")
+            print(f"Successfully analyzed: {analyzed_files}")
+            print(f"Errors: {error_count}")
+            print(f"New files: {scd2_stats['new_files']}")
+            print(f"Updated files: {scd2_stats['updated_files']}")
+            print(f"Unchanged files: {scd2_stats['unchanged_files']}")
+            print(f"Deleted files: {scd2_stats['deleted_files']}")
+            
+            return scan_id, scd2_stats
+            
+        except Exception as e:
+            # Update scan record with error
+            self.update_scan_record(
+                scan_id,
+                scan_end_time=datetime.utcnow(),
+                scan_status='failed',
+                error_message=str(e)
+            )
+            raise
+
+    def get_file_history(self, file_path: str) -> pd.DataFrame:
+        """Get complete history for a specific file"""
+        query = text("""
+            SELECT * FROM file_statistics_history 
+            WHERE file_path = :file_path 
+            ORDER BY effective_date DESC
+        """)
+        
+        with self.engine.connect() as conn:
+            return pd.read_sql(query, conn, params={'file_path': file_path})
+
+    def get_current_statistics(self) -> pd.DataFrame:
+        """Get current statistics for all files"""
+        query = text("""
+            SELECT * FROM file_statistics_history 
+            WHERE is_current = 1 
+            ORDER BY file_path
+        """)
+        
+        with self.engine.connect() as conn:
+            return pd.read_sql(query, conn)
+
+    def generate_change_report(self, days_back: int = 7) -> pd.DataFrame:
+        """Generate a report of all changes in the last N days"""
+        query = text("""
+            SELECT file_path, file_name, effective_date, end_date, 
+                   change_reason, is_current, scan_id
+            FROM file_statistics_history 
+            WHERE record_created_date >= DATEADD(day, -:days_back, GETUTCDATE())
+            ORDER BY record_created_date DESC
+        """)
+        
+        with self.engine.connect() as conn:
+            return pd.read_sql(query, conn, params={'days_back': days_back})
+
+def main():
+    """Main function for command-line usage"""
+    import argparse
     
-    'Deployment Model': [
-        'User Profile',
-        'User Profile',
-        'User Profile',
-        'User Profile',
-        'File-based',
-        'Container/VM',
-        'Application',
-        'Application',
-        'Multi-node Cluster',
-        'Multi-node Cluster',
-        'Multi-node Cluster',
-        'Multi-node Cluster',
-        'SaaS + Gateway',
-        'Hardware Appliance',
-        'Hardware Appliance',
-        'Managed Service',
-        'Server Infrastructure',
-        'Domain Controller'
-    ],
+    parser = argparse.ArgumentParser(description="File Statistics Tracker with SQL Server SCD2")
+    parser.add_argument("directory", help="Directory to analyze")
+    parser.add_argument("--server", required=True, help="SQL Server instance")
+    parser.add_argument("--database", required=True, help="Database name")
+    parser.add_argument("--username", help="Database username")
+    parser.add_argument("--password", help="Database password")
+    parser.add_argument("--recursive", "-r", action="store_true", help="Scan recursively")
+    parser.add_argument("--hidden", action="store_true", help="Include hidden files")
+    parser.add_argument("--report", action="store_true", help="Generate change report")
+    parser.add_argument("--days", type=int, default=7, help="Days back for report")
     
-    'Vendor/Library': [
-        # Local
-        'Python keyring library',
-        'Microsoft Windows',
-        'Apple',
-        'freedesktop.org',
-        'KeePass Team',
-        'HashiCorp',
-        'Custom Development',
-        'Python Cryptography',
-        # Enterprise
-        'HashiCorp',
-        'CyberArk',
-        'Delinea (formerly Thycotic)',
-        'BeyondTrust',
-        'Akeyless',
-        'Thales',
-        'Entrust',
-        'Amazon Web Services',
-        'Venafi',
-        'Microsoft'
-    ],
+    args = parser.parse_args()
     
-    'Authentication Methods': [
-        # Local
-        'OS user login',
-        'Windows user credentials, DPAPI',
-        'macOS user login, TouchID, Secure Enclave',
-        'Desktop session, GNOME/KDE integration',
-        'Master password, key file, YubiKey',
-        'Token, AppRole, UserPass, Cert (dev mode)',
-        'Master password with key derivation',
-        'Password + Argon2id KDF',
-        # Enterprise
-        'X.509 certificates, mTLS, Hardware tokens (PKCS#11), IP allowlisting, Cloud managed identities',
-        'X.509 certificates, Application hash validation, OS user auth, IP/network restrictions',
-        'FIDO2 hardware tokens, OAuth2, Windows integration',
-        'FIDO2 authentication, mTLS, Certificate-based',
-        'Zero-knowledge crypto, SaaS-first (gateway for on-prem)',
-        'X.509 certificates, NTLS, STC protocols, Hardware token integration',
-        'Multi-factor auth via Operator Card Sets, CodeSafe capability',
-        'FIPS 140-2 Level 3, AWS native integration',
-        'mTLS configuration, Policy-driven certificates',
-        'Smart card, Certificate-based logon, NDES'
-    ],
-    
-    'Security Level': [
-        # Local
-        'Good - OS protected',
-        'Good - DPAPI/AES-256',
-        'Excellent - Hardware-backed',
-        'Good - AES-256',
-        'Excellent - AES-256/ChaCha20',
-        'Good - In-memory (dev)',
-        'Variable - Implementation dependent',
-        'Excellent - Modern crypto',
-        # Enterprise
-        'Excellent - Enterprise-grade',
-        'Excellent - Bank-grade',
-        'Excellent - Enterprise-grade',
-        'Excellent - Enterprise-grade',
-        'Excellent - Zero-knowledge',
-        'Excellent - Hardware-based',
-        'Excellent - Hardware-based',
-        'Excellent - Cloud HSM',
-        'Excellent - Enterprise PKI',
-        'Good - Enterprise PKI'
-    ],
-    
-    'Compliance/Encryption': [
-        # Local
-        'OS-dependent encryption',
-        'DPAPI with AES-256',
-        'Hardware encryption via Secure Enclave',
-        'AES-256 encryption',
-        'AES-256, ChaCha20, Argon2',
-        'AES-256-GCM, Shamir sharing',
-        'Customizable (Fernet, AES, etc.)',
-        'Argon2id + AES-256-GCM',
-        # Enterprise
-        'SOC2, FIPS 140-2, Common Criteria',
-        'SOC 1/2 Type II, PCI-DSS Level 1, FFIEC, Common Criteria EAL4+, FIPS 140-2 Level 3',
-        'SOC2, PCI-DSS, HIPAA',
-        'SOC2, PCI-DSS, FIPS 140-2',
-        'SOC2, ISO 27001, GDPR',
-        'FIPS 140-2 Level 3, FIPS 140-3 Level 3, Common Criteria',
-        'FIPS 140-3 Level 3, Common Criteria EAL4+',
-        'FIPS 140-2 Level 3',
-        'SOC2, ISO 27001',
-        'Windows security compliance, Active Directory integrated'
-    ],
-    
-    'Python Integration': [
-        # Local
-        'pip install keyring',
-        'keyring + pywin32',
-        'keyring (native)',
-        'keyring + secretstorage',
-        'pip install pykeepass',
-        'pip install hvac',
-        'cryptography library',
-        'pip install cryptography argon2-cffi',
-        # Enterprise
-        'hvac library (official)',
-        'pyAIM (official)',
-        'python-tss-sdk (official)',
-        'API available',
-        'API available',
-        'PKCS#11 interface',
-        'PKCS#11 interface',
-        'AWS SDK integration',
-        'VCert SDK (official)',
-        'certsrv library'
-    ],
-    
-    'Offline Capability': [
-        # Local
-        'Yes - Fully offline',
-        'Yes - Fully offline',
-        'Yes - Fully offline',
-        'Yes - Fully offline',
-        'Yes - Fully offline',
-        'Yes - Local dev mode',
-        'Yes - Fully offline',
-        'Yes - Fully offline',
-        # Enterprise
-        'Yes - On-premises option',
-        'Yes - On-premises option',
-        'Optional - Can be on-prem',
-        'Yes - On-premises option',
-        'No - Requires gateway',
-        'Yes - Hardware-based',
-        'Yes - Hardware-based',
-        'No - AWS only',
-        'Yes - On-premises option',
-        'Yes - On-premises'
-    ],
-    
-    'Deployment Complexity': [
-        # Local
-        'Very Low - OS built-in',
-        'Very Low - OS built-in',
-        'Very Low - OS built-in',
-        'Low - Package install',
-        'Low - Single file/app',
-        'Medium - Server setup',
-        'Medium - Custom code',
-        'Medium - Custom code',
-        # Enterprise
-        'High - Enterprise deployment',
-        'High - Enterprise deployment',
-        'Medium-High - Modern architecture',
-        'High - Enterprise deployment',
-        'Medium - SaaS-based',
-        'High - Hardware installation',
-        'High - Hardware installation',
-        'Medium - Cloud service',
-        'High - Enterprise PKI',
-        'Medium - Windows infrastructure'
-    ],
-    
-    'Cost': [
-        # Local
-        'Free',
-        'Free (Windows included)',
-        'Free (macOS included)',
-        'Free (Linux included)',
-        'Free (OSS) / $40 (KeePassXC Pro)',
-        'Free (dev) / Enterprise pricing',
-        'Development time only',
-        'Free (libraries)',
-        # Enterprise
-        '$0.50/secret/month (SaaS) or enterprise custom',
-        'Identity-based licensing, 10-15% cheaper than Vault for >150 secrets',
-        'Per-tenant cloud-native pricing',
-        'Asset-based, 30-40% less than CyberArk',
-        'Usage-based SaaS pricing',
-        '$2,000-$4,000 per network HSM',
-        '$2,000-$4,000 per network HSM',
-        'Pay-per-use cloud pricing',
-        'Enterprise licensing',
-        'Included with Windows Server'
-    ],
-    
-    'Team Sharing': [
-        # Local
-        'No - Single user',
-        'No - Single user',
-        'No - Single user', 
-        'No - Single user',
-        'Yes - File sharing',
-        'Yes - Multi-user',
-        'Depends on implementation',
-        'Depends on implementation',
-        # Enterprise
-        'Yes - Full RBAC',
-        'Yes - Full RBAC',
-        'Yes - Full RBAC',
-        'Yes - Full RBAC',
-        'Yes - Full RBAC',
-        'Yes - Managed access',
-        'Yes - Managed access',
-        'Yes - IAM integration',
-        'Yes - Policy-based',
-        'Yes - AD integrated'
-    ],
-    
-    'Performance': [
-        # Local
-        'Sub-millisecond',
-        'Sub-millisecond',
-        'Sub-millisecond',
-        'Sub-millisecond',
-        'Sub-millisecond (1000s entries)',
-        'Sub-millisecond',
-        '1-5ms (with encryption)',
-        '100-500ms (key derivation)',
-        # Enterprise
-        'Sub-millisecond retrieval',
-        'Enterprise-grade performance',
-        'Good performance',
-        'Good performance',
-        'Cloud-optimized performance',
-        '20,000 ECC / 10,000 RSA ops/sec',
-        'High performance with CodeSafe',
-        'Cloud-scale performance',
-        'Automated certificate operations',
-        'Standard Windows performance'
-    ],
-    
-    'Best Use Case': [
-        # Local
-        'Individual developer, local scripts',
-        'Windows developers, .NET integration',
-        'macOS developers, iOS development',
-        'Linux desktop users',
-        'Small teams, file-based sharing',
-        'Local development, testing',
-        'Specific security requirements',
-        'High-security custom apps',
-        # Enterprise
-        'Large technical teams, multi-cloud',
-        'Financial institutions, max compliance',
-        'Windows-centric enterprises',
-        'Cost-conscious enterprises',
-        'Cloud-first organizations',
-        'High-security crypto operations',
-        'Custom security applications',
-        'AWS-based infrastructure',
-        'Large-scale certificate management',
-        'Microsoft environments'
-    ],
-    
-    'Limitations': [
-        # Local
-        'Single-user, no sharing',
-        'Windows only, single-user',
-        'macOS only, single-user',
-        'Desktop session required',
-        'Manual sync for teams',
-        'Dev mode not for production',
-        'Requires custom development',
-        'Complex implementation',
-        # Enterprise
-        'Complex setup, cost at scale',
-        'High cost, complex licensing',
-        'Newer platform, less mature',
-        'Limited advanced features',
-        'Requires internet connection',
-        'High cost, hardware management',
-        'High cost, hardware management',
-        'AWS lock-in, online only',
-        'Certificate-focused only',
-        'Windows-centric'
-    ],
-    
-    'Audit/Logging': [
-        # Local
-        'None',
-        'Windows Event Log',
-        'Console logs only',
-        'Limited',
-        'Basic file access logs',
-        'Basic (dev mode)',
-        'Custom implementation',
-        'Custom implementation',
-        # Enterprise
-        'Full audit trail',
-        'Comprehensive + video',
-        'Full audit trail',
-        'Full audit trail',
-        'Full audit trail',
-        'Hardware audit logs',
-        'Hardware audit logs',
-        'CloudTrail integration',
-        'Full audit trail',
-        'Windows audit logs'
-    ]
-}
-
-# Create the comprehensive dataframe
-df_all_solutions = pd.DataFrame(all_solutions_data)
-
-# Create Python code examples dataframe
-code_examples_data = {
-    'Solution': [
-        'OS Keyring',
-        'KeePass',
-        'HashiCorp Vault (Dev)',
-        'Custom Encrypted Storage',
-        'CyberArk (Enterprise)',
-        'Thales HSM'
-    ],
-    'Install Command': [
-        'pip install keyring',
-        'pip install pykeepass',
-        'pip install hvac',
-        'pip install cryptography argon2-cffi',
-        'pip install pyAIM',
-        'pip install PyKCS11'
-    ],
-    'Store Credential': [
-        'keyring.set_password("service", "username", "password")',
-        'kp.add_entry(group, "title", username="user", password="pass")',
-        'client.secrets.kv.v2.create_or_update_secret(path="db", secret={"pass": "pwd"})',
-        'encrypted = cipher.encrypt(json.dumps(creds).encode())',
-        'N/A - Managed via CyberArk UI',
-        'session.generate_keypair(pkcs11.KeyType.RSA, 2048)'
-    ],
-    'Retrieve Credential': [
-        'password = keyring.get_password("service", "username")',
-        'entry = kp.find_entries(title="title", first=True)',
-        'secret = client.secrets.kv.read_secret_version(path="db")',
-        'creds = json.loads(cipher.decrypt(encrypted).decode())',
-        'response = aimccp.GetPassword(appid="MyApp", safe="Prod")',
-        'signature = private_key.sign(data, mechanism=pkcs11.Mechanism.SHA256_RSA_PKCS)'
-    ]
-}
-
-df_code_examples = pd.DataFrame(code_examples_data)
-
-# Create comparison matrix for local solutions
-local_comparison = {
-    'Feature': [
-        'Zero Configuration',
-        'Cross-Platform',
-        'Team Sharing',
-        'Hardware Security',
-        'Offline Operation',
-        'Python Native',
-        'Custom Encryption',
-        'Performance',
-        'Audit Trail'
-    ],
-    'OS Keyring': ['Yes', 'Yes', 'No', 'Partial', 'Yes', 'Yes', 'No', 'Excellent', 'No'],
-    'KeePass': ['No', 'Yes', 'Yes', 'Yes', 'Yes', 'Yes', 'Yes', 'Excellent', 'Basic'],
-    'Vault Dev': ['No', 'Yes', 'Yes', 'No', 'Yes', 'Yes', 'Yes', 'Excellent', 'Basic'],
-    'Custom Crypto': ['No', 'Yes', 'Optional', 'Optional', 'Yes', 'Yes', 'Yes', 'Good', 'Optional']
-}
-
-df_local_comparison = pd.DataFrame(local_comparison)
-
-# Create migration path dataframe
-migration_paths = {
-    'Current Solution': [
-        '.env files',
-        'OS Keyring',
-        'KeePass',
-        'Custom Encrypted',
-        'Vault Dev Mode'
-    ],
-    'Recommended Path': [
-        'OS Keyring → KeePass → Vault',
-        'KeePass (team) or Vault (scale)',
-        'Vault Dev → Vault Enterprise',
-        'Vault or CyberArk',
-        'Vault Enterprise'
-    ],
-    'Migration Effort': [
-        'Low → Medium → High',
-        'Low → Medium',
-        'Medium',
-        'High',
-        'Medium'
-    ],
-    'Key Benefits': [
-        'Immediate security improvement',
-        'Team sharing, better organization',
-        'Production-ready, compliance',
-        'Standard solution, support',
-        'Full enterprise features'
-    ]
-}
-
-df_migration = pd.DataFrame(migration_paths)
-
-# Create security comparison dataframe
-security_comparison = {
-    'Security Aspect': [
-        'Encryption at Rest',
-        'Encryption in Transit',
-        'Key Management',
-        'Access Control',
-        'Rotation Support',
-        'Memory Protection',
-        'Hardware Security',
-        'Compliance Ready'
-    ],
-    'Local Solutions': [
-        'OS-dependent (Good)',
-        'N/A (Local only)',
-        'OS/App managed',
-        'User-based only',
-        'Manual',
-        'OS-dependent',
-        'macOS only',
-        'No'
-    ],
-    'Enterprise Solutions': [
-        'AES-256 minimum',
-        'TLS 1.3',
-        'Automated lifecycle',
-        'RBAC + Policies',
-        'Automated',
-        'Secure enclave',
-        'HSM available',
-        'Yes (Multiple)'
-    ]
-}
-
-df_security = pd.DataFrame(security_comparison)
-
-# Display all dataframes
-print("=== COMPREHENSIVE CREDENTIAL MANAGEMENT SOLUTIONS ===")
-print(df_all_solutions.to_string(index=False))
-print("\n")
-
-print("=== PYTHON CODE EXAMPLES ===")
-print(df_code_examples.to_string(index=False))
-print("\n")
-
-print("=== LOCAL SOLUTIONS FEATURE COMPARISON ===")
-print(df_local_comparison.to_string(index=False))
-print("\n")
-
-print("=== MIGRATION PATHS ===")
-print(df_migration.to_string(index=False))
-print("\n")
-
-print("=== SECURITY COMPARISON: LOCAL VS ENTERPRISE ===")
-print(df_security.to_string(index=False))
-
-# Export to Excel with multiple sheets
-with pd.ExcelWriter('comprehensive_credential_solutions.xlsx', engine='openpyxl') as writer:
-    # Main comparison
-    df_all_solutions.to_excel(writer, sheet_name='All Solutions', index=False)
-    
-    # Separate views by Local/Enterprise
-    df_local = df_all_solutions[df_all_solutions['Type'] == 'Local']
-    df_enterprise = df_all_solutions[df_all_solutions['Type'] == 'Enterprise']
-    
-    df_local.to_excel(writer, sheet_name='Local Solutions', index=False)
-    df_enterprise.to_excel(writer, sheet_name='Enterprise Solutions', index=False)
-    
-    # Additional analysis sheets
-    df_code_examples.to_excel(writer, sheet_name='Code Examples', index=False)
-    df_local_comparison.to_excel(writer, sheet_name='Local Features', index=False)
-    df_migration.to_excel(writer, sheet_name='Migration Paths', index=False)
-    df_security.to_excel(writer, sheet_name='Security Comparison', index=False)
-    decision_matrix.to_excel(writer, sheet_name='Decision Matrix', index=False)
-    local_vs_enterprise.to_excel(writer, sheet_name='Local vs Enterprise', index=False)
-    solution_categories.to_excel(writer, sheet_name='Solutions by Use Case', index=False)
-    
-    # Auto-adjust column widths
-    for sheet in writer.sheets.values():
-        for column in sheet.columns:
-            max_length = 0
-            column_letter = column[0].column_letter
-            for cell in column:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = min(max_length + 2, 60)
-            sheet.column_dimensions[column_letter].width = adjusted_width
-
-print("\nComprehensive analysis exported to 'comprehensive_credential_solutions.xlsx'")
-
-# Create a quick decision matrix
-decision_matrix = pd.DataFrame({
-    'Scenario': [
-        'Individual developer, local only',
-        'Small team (2-5), cost sensitive',
-        'Medium team, some compliance needs',
-        'Large enterprise, bank compliance',
-        'High-performance crypto needed',
-        'Cloud migration planned'
-    ],
-    'Recommended Solution': [
-        'OS Keyring (free, simple)',
-        'KeePass with shared file',
-        'HashiCorp Vault or Thycotic',
-        'CyberArk PAS + HSM',
-        'Thales Luna HSM',
-        'HashiCorp Vault Enterprise'
-    ],
-    'Alternative': [
-        'KeePass for more features',
-        'Vault Dev Mode',
-        'BeyondTrust (cost savings)',
-        'HashiCorp Vault + HSM',
-        'Entrust nShield',
-        'Akeyless (cloud-first)'
-    ],
-    'Estimated Cost': [
-        'Free',
-        'Free - $200',
-        '$50K - $200K/year',
-        '$200K - $500K/year',
-        '$20K - $50K hardware',
-        '$100K - $300K/year'
-    ]
-})
-
-print("\n=== QUICK DECISION MATRIX ===")
-print(decision_matrix.to_string(index=False))
-
-# Create Local vs Enterprise summary comparison
-local_vs_enterprise = pd.DataFrame({
-    'Aspect': [
-        'Number of Solutions',
-        'Cost Range',
-        'Setup Time',
-        'Team Support',
-        'Compliance Certifications',
-        'Typical Organization Size',
-        'Internet Required',
-        'Python Integration',
-        'Audit Capabilities',
-        'Hardware Security',
-        'Automated Rotation',
-        'High Availability'
-    ],
-    'Local Solutions': [
-        '8 options',
-        'Free - $40',
-        'Minutes to hours',
-        'Limited (file sharing)',
-        'None',
-        '1-10 developers',
-        'No',
-        'Simple libraries',
-        'None to basic',
-        'macOS only',
-        'Manual only',
-        'No'
-    ],
-    'Enterprise Solutions': [
-        '10 options',
-        '$50K - $500K/year',
-        'Weeks to months',
-        'Full RBAC',
-        'SOC2, PCI-DSS, FIPS',
-        '50+ developers',
-        'Optional',
-        'Official SDKs',
-        'Comprehensive',
-        'HSM available',
-        'Fully automated',
-        'Yes'
-    ]
-})
-
-print("\n=== LOCAL VS ENTERPRISE COMPARISON ===")
-print(local_vs_enterprise.to_string(index=False))
-
-# Create solution categorization by use case
-solution_categories = pd.DataFrame({
-    'Use Case': [
-        'Individual Developer',
-        'Small Team (2-10)',
-        'Medium Team (11-50)',
-        'Large Team (50+)',
-        'Regulated Industry',
-        'High Security Needs'
-    ],
-    'Local Solutions': [
-        'OS Keyring, KeePass',
-        'KeePass, Vault Dev',
-        'Vault Dev',
-        'Not recommended',
-        'Not suitable',
-        'Custom Encrypted'
-    ],
-    'Enterprise Solutions': [
-        'Overkill',
-        'Vault, Thycotic',
-        'Vault, BeyondTrust',
-        'CyberArk, Vault Enterprise',
-        'CyberArk + HSM',
-        'Thales/Entrust HSM'
-    ],
-    'Minimum Cost': [
-        'Free',
-        'Free - $200',
-        '$50K/year',
-        '$100K/year',
-        '$200K/year',
-        '$20K hardware'
-    ]
-})
-
-print("\n=== SOLUTION CATEGORIES BY USE CASE ===")
-print(solution_categories.to_string(index=False))
-
-# Example: Filter and analyze local vs enterprise
-print("\n=== FILTERING EXAMPLES ===")
-print(f"Total Local Solutions: {len(df_all_solutions[df_all_solutions['Type'] == 'Local'])}")
-print(f"Total Enterprise Solutions: {len(df_all_solutions[df_all_solutions['Type'] == 'Enterprise'])}")
-print(f"\nFree Local Solutions:")
-print(df_all_solutions[(df_all_solutions['Type'] == 'Local') & (df_all_solutions['Cost'] == 'Free')]['Solution Name'].tolist())
-print(f"\nOffline-Capable Enterprise Solutions:")
-print(df_all_solutions[(df_all_solutions['Type'] == 'Enterprise') & (df_all_solutions['Offline Capability'].str.startswith('Yes'))]['Solution Name'].tolist())
-
-# Create Local vs Enterprise summary comparison
-local_vs_enterprise = pd.DataFrame({
-    'Aspect': [
-        'Number of Solutions',
-        'Cost Range',
-        'Setup Time',
-        'Team Support',
-        'Compliance Certifications',
-        'Typical Organization Size',
-        'Internet Required',
-        'Python Integration',
-        'Audit Capabilities',
-        'Hardware Security',
-        'Automated Rotation',
-        'High Availability'
-    ],
-    'Local Solutions': [
-        '8 options',
-        'Free - $40',
-        'Minutes to hours',
-        'Limited (file sharing)',
-        'None',
-        '1-10 developers',
-        'No',
-        'Simple libraries',
-        'None to basic',
-        'macOS only',
-        'Manual only',
-        'No'
-    ],
-    'Enterprise Solutions': [
-        '10 options',
-        '$50K - $500K/year',
-        'Weeks to months',
-        'Full RBAC',
-        'SOC2, PCI-DSS, FIPS',
-        '50+ developers',
-        'Optional',
-        'Official SDKs',
-        'Comprehensive',
-        'HSM available',
-        'Fully automated',
-        'Yes'
-    ]
-})
-
-print("\n=== LOCAL VS ENTERPRISE COMPARISON ===")
-print(local_vs_enterprise.to_string(index=False))
-
-# Create solution categorization by use case
-solution_categories = pd.DataFrame({
-    'Use Case': [
-        'Individual Developer',
-        'Small Team (2-10)',
-        'Medium Team (11-50)',
-        'Large Team (50+)',
-        'Regulated Industry',
-        'High Security Needs'
-    ],
-    'Local Solutions': [
-        'OS Keyring, KeePass',
-        'KeePass, Vault Dev',
-        'Vault Dev',
-        'Not recommended',
-        'Not suitable',
-        'Custom Encrypted'
-    ],
-    'Enterprise Solutions': [
-        'Overkill',
-        'Vault, Thycotic',
-        'Vault, BeyondTrust',
-        'CyberArk, Vault Enterprise',
-        'CyberArk + HSM',
-        'Thales/Entrust HSM'
-    ],
-    'Minimum Cost': [
-        'Free',
-        'Free - $200',
-        '$50K/year',
-        '$100K/year',
-        '$200K/year',
-        '$20K hardware'
-    ]
-})
-
-print("\n=== SOLUTION CATEGORIES BY USE CASE ===")
-print(solution_categories.to_string(index=False))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# Below is React.
-
-import pandas as pd
-
-# Main storage mechanisms comparison
-storage_mechanisms_data = {
-    'Storage Type': [
-        'localStorage',
-        'sessionStorage',
-        'Cookies (HttpOnly)',
-        'Memory (React State)',
-        'IndexedDB',
-        'iOS Keychain (React Native)',
-        'Android Keystore (React Native)',
-        'Expo SecureStore',
-        'react-native-keychain',
-        'react-native-encrypted-storage'
-    ],
-    
-    'Platform': [
-        'Web', 'Web', 'Web', 'Web', 'Web',
-        'iOS Mobile', 'Android Mobile', 'Mobile (Expo)', 'Mobile (RN)', 'Mobile (RN)'
-    ],
-    
-    'Security Level': [
-        'Very Low', 'Very Low', 'Low-Medium', 'Medium', 'Very Low',
-        'Excellent', 'Excellent', 'Excellent', 'Excellent', 'Very Good'
-    ],
-    
-    'Encryption': [
-        'None (plaintext)', 'None (plaintext)', 'Transport only', 'None', 'None (plaintext)',
-        'Hardware-backed AES', 'Hardware-backed', 'Platform secure storage', 'Platform secure storage', 'AES-256'
-    ],
-    
-    'XSS Vulnerable': [
-        'Yes', 'Yes', 'No (if HttpOnly)', 'Yes', 'Yes',
-        'No', 'No', 'No', 'No', 'No'
-    ],
-    
-    'Persistence': [
-        'Permanent', 'Session only', 'Configurable', 'Session only', 'Permanent',
-        'Permanent', 'Permanent', 'Permanent', 'Permanent', 'Permanent'
-    ],
-    
-    'Size Limit': [
-        '5-10MB', '5-10MB', '4KB', 'Memory limited', '50MB+',
-        'Unlimited', 'Unlimited', '2KB', 'Unlimited', 'Unlimited'
-    ],
-    
-    'Biometric Support': [
-        'No', 'No', 'No', 'No', 'No',
-        'Yes (Touch/Face ID)', 'Yes (Fingerprint)', 'Yes', 'Yes', 'No'
-    ],
-    
-    'Developer Tools Access': [
-        'Yes', 'Yes', 'Partial', 'Yes (React DevTools)', 'Yes',
-        'No', 'No', 'No', 'No', 'No'
-    ],
-    
-    'Compliance Safe': [
-        'No', 'No', 'Partial', 'No', 'No',
-        'Yes', 'Yes', 'Yes', 'Yes', 'Yes'
-    ]
-}
-
-df_storage = pd.DataFrame(storage_mechanisms_data)
-
-# Security vulnerabilities comparison
-vulnerabilities_data = {
-    'Vulnerability': [
-        'XSS Attack',
-        'Physical Device Access',
-        'Browser Extension Access',
-        'Memory Dump',
-        'Network Interception',
-        'Malware/Infostealer',
-        'CSRF Attack',
-        'Session Hijacking',
-        'Certificate Bypass'
-    ],
-    
-    'Browser Storage Risk': [
-        'Critical', 'High', 'High', 'Medium', 'N/A', 'Critical', 'Medium', 'High', 'N/A'
-    ],
-    
-    'Cookie Risk': [
-        'Low (HttpOnly)', 'Medium', 'Medium', 'Low', 'Medium', 'High', 'High', 'Medium', 'N/A'
-    ],
-    
-    'Mobile Secure Storage Risk': [
-        'None', 'Low (biometric)', 'None', 'Very Low', 'Low', 'Low', 'None', 'Low', 'Low (pinning)'
-    ],
-    
-    'Impact': [
-        'Complete credential theft',
-        'Direct credential access',
-        'Automated credential harvesting',
-        'Potential key extraction',
-        'Token interception',
-        'Mass credential theft',
-        'Unauthorized actions',
-        'Account takeover',
-        'MITM attacks'
-    ],
-    
-    'Mitigation': [
-        'CSP, input validation',
-        'Device encryption, timeout',
-        'Secure storage only',
-        'Non-extractable keys',
-        'HTTPS, certificate pinning',
-        'Secure storage, monitoring',
-        'CSRF tokens, SameSite',
-        'Session management',
-        'Certificate pinning'
-    ]
-}
-
-df_vulnerabilities = pd.DataFrame(vulnerabilities_data)
-
-# Authentication patterns comparison
-auth_patterns_data = {
-    'Pattern': [
-        'Backend-for-Frontend (BFF)',
-        'OAuth2 with PKCE',
-        'JWT in Memory',
-        'WebAuthn/FIDO2',
-        'Zero-Knowledge',
-        'Session Cookies',
-        'API Key Proxy',
-        'Certificate-Based',
-        'Biometric (Mobile)'
-    ],
-    
-    'Client Storage Required': [
-        'None', 'Memory only', 'Memory only', 'None', 'Encrypted keys', 
-        'Cookie only', 'None', 'Certificate', 'Secure enclave'
-    ],
-    
-    'Security Level': [
-        'Excellent', 'Very Good', 'Good', 'Excellent', 'Excellent',
-        'Good', 'Very Good', 'Excellent', 'Excellent'
-    ],
-    
-    'Implementation Complexity': [
-        'High', 'Medium', 'Low', 'High', 'Very High',
-        'Low', 'Medium', 'High', 'Medium'
-    ],
-    
-    'Offline Support': [
-        'No', 'Limited', 'No', 'Yes', 'Yes',
-        'No', 'No', 'Yes', 'Yes'
-    ],
-    
-    'Best For': [
-        'Enterprise SPAs',
-        'Public APIs',
-        'Simple apps',
-        'High security',
-        'Maximum privacy',
-        'Traditional web',
-        'Microservices',
-        'Corporate apps',
-        'Mobile apps'
-    ],
-    
-    'Token Rotation': [
-        'Automatic', 'Refresh tokens', 'Manual', 'N/A', 'User-controlled',
-        'Session-based', 'Backend managed', 'Certificate expiry', 'N/A'
-    ]
-}
-
-df_auth_patterns = pd.DataFrame(auth_patterns_data)
-
-# Compliance requirements matrix
-compliance_data = {
-    'Framework': [
-        'PCI-DSS',
-        'SOC2',
-        'HIPAA',
-        'GDPR',
-        'CCPA',
-        'ISO 27001',
-        'NIST 800-53',
-        'FedRAMP'
-    ],
-    
-    'Prohibits Browser Storage': [
-        'Yes', 'Yes', 'Yes', 'Effectively', 'Implied', 'Yes', 'Yes', 'Yes'
-    ],
-    
-    'Required Security': [
-        'Encryption, tokenization',
-        'Access controls, MFA',
-        'Unique ID, encryption',
-        'Appropriate measures',
-        'Reasonable security',
-        'Risk management',
-        'Comprehensive controls',
-        'Federal standards'
-    ],
-    
-    'Max Penalty': [
-        '$100K/month',
-        'Business loss',
-        '$1.5M/violation',
-        '€20M or 4% revenue',
-        '$7,500/violation',
-        'Certification loss',
-        'Contract termination',
-        'Authorization loss'
-    ],
-    
-    'Audit Focus': [
-        'Card data protection',
-        'Access management',
-        'PHI security',
-        'Data protection',
-        'Consumer privacy',
-        'Security controls',
-        'Control implementation',
-        'Continuous monitoring'
-    ],
-    
-    'Credential Requirements': [
-        'No storage after auth',
-        'Encrypted, controlled',
-        'Secure, auditable',
-        'Encrypted, minimal',
-        'Protected',
-        'Managed access',
-        'Strong authentication',
-        'Multi-factor required'
-    ]
-}
-
-df_compliance = pd.DataFrame(compliance_data)
-
-# Implementation solutions comparison
-solutions_data = {
-    'Solution': [
-        'Auth0 React SDK',
-        'AWS Amplify',
-        'Firebase Auth',
-        'Okta React',
-        'react-native-keychain',
-        'expo-secure-store',
-        'Web Crypto API',
-        'react-use-auth',
-        'NextAuth.js',
-        'Supabase Auth'
-    ],
-    
-    'Type': [
-        'Auth Service', 'Cloud Platform', 'Cloud Platform', 'Auth Service',
-        'Mobile Library', 'Mobile Library', 'Browser API', 'React Hook',
-        'Framework', 'Backend Service'
-    ],
-    
-    'Platform Support': [
-        'Web + Mobile', 'Web + Mobile', 'Web + Mobile', 'Web + Mobile',
-        'iOS + Android', 'Expo Only', 'Web Only', 'Web Only',
-        'Next.js Only', 'Web + Mobile'
-    ],
-    
-    'Storage Approach': [
-        'Memory + Secure refresh',
-        'localStorage (insecure)',
-        'Memory + IndexedDB',
-        'Memory + Secure refresh',
-        'Hardware secure',
-        'Platform secure',
-        'Non-extractable keys',
-        'Configurable',
-        'Server-side sessions',
-        'Server-side + cookies'
-    ],
-    
-    'Security Rating': [
-        'Excellent', 'Poor', 'Good', 'Excellent',
-        'Excellent', 'Excellent', 'Good', 'Variable',
-        'Excellent', 'Very Good'
-    ],
-    
-    'Cost': [
-        'Free tier + Paid',
-        'Pay per use',
-        'Free tier + Paid',
-        'Enterprise',
-        'Free (OSS)',
-        'Free',
-        'Free',
-        'Free (OSS)',
-        'Free (OSS)',
-        'Free tier + Paid'
-    ],
-    
-    'Key Features': [
-        'PKCE, MFA, passwordless',
-        'Full AWS integration',
-        'Real-time, social auth',
-        'Enterprise SSO',
-        'Biometric, hardware security',
-        'Simple API, Expo compatible',
-        'Hardware acceleration',
-        'Flexible, lightweight',
-        'Built-in providers',
-        'Row-level security'
-    ]
-}
-
-df_solutions = pd.DataFrame(solutions_data)
-
-# Security best practices
-best_practices_data = {
-    'Practice': [
-        'Never store credentials in browser storage',
-        'Use HttpOnly, Secure, SameSite cookies',
-        'Implement CSP headers',
-        'Regular security audits',
-        'API key rotation',
-        'Certificate pinning (mobile)',
-        'Biometric authentication',
-        'Zero-trust architecture',
-        'Minimal data retention',
-        'Encryption at rest and transit'
-    ],
-    
-    'Category': [
-        'Storage', 'Cookies', 'XSS Prevention', 'Testing', 'Key Management',
-        'Mobile Security', 'Authentication', 'Architecture', 'Privacy', 'Encryption'
-    ],
-    
-    'Priority': [
-        'Critical', 'High', 'High', 'High', 'Medium',
-        'High', 'Medium', 'High', 'High', 'Critical'
-    ],
-    
-    'Implementation Effort': [
-        'Low', 'Low', 'Medium', 'High', 'Medium',
-        'Medium', 'Medium', 'Very High', 'Low', 'Medium'
-    ],
-    
-    'Compliance Impact': [
-        'All frameworks', 'PCI-DSS, SOC2', 'OWASP Top 10', 'All frameworks', 'SOC2, ISO',
-        'Mobile specific', 'HIPAA, PCI', 'Modern standard', 'GDPR, CCPA', 'All frameworks'
-    ]
-}
-
-df_best_practices = pd.DataFrame(best_practices_data)
-
-# Performance metrics
-performance_data = {
-    'Operation': [
-        'localStorage read',
-        'Cookie read',
-        'Keychain read',
-        'Web Crypto encrypt (1MB)',
-        'JWT decode',
-        'Session validation',
-        'Biometric auth',
-        'Certificate validation'
-    ],
-    
-    'Web Performance': [
-        '<1ms', '<1ms', 'N/A', '~5ms', '<1ms', '~10ms network', 'N/A', '~5ms'
-    ],
-    
-    'Mobile Performance': [
-        'N/A', 'N/A', '~10ms', '~10ms', '<1ms', '~50ms network', '~500ms', '~10ms'
-    ],
-    
-    'Security Overhead': [
-        'None', 'Minimal', 'Minimal', 'Acceptable', 'Minimal', 'Network latency', 'User interaction', 'Minimal'
-    ]
-}
-
-df_performance = pd.DataFrame(performance_data)
-
-# Display all dataframes
-print("=== REACT CREDENTIAL STORAGE MECHANISMS ===")
-print(df_storage.to_string(index=False))
-print("\n")
-
-print("=== SECURITY VULNERABILITIES COMPARISON ===")
-print(df_vulnerabilities.to_string(index=False))
-print("\n")
-
-print("=== AUTHENTICATION PATTERNS ===")
-print(df_auth_patterns.to_string(index=False))
-print("\n")
-
-print("=== COMPLIANCE REQUIREMENTS ===")
-print(df_compliance.to_string(index=False))
-print("\n")
-
-print("=== IMPLEMENTATION SOLUTIONS ===")
-print(df_solutions.to_string(index=False))
-print("\n")
-
-print("=== SECURITY BEST PRACTICES ===")
-print(df_best_practices.to_string(index=False))
-print("\n")
-
-print("=== PERFORMANCE METRICS ===")
-print(df_performance.to_string(index=False))
-
-# Export to Excel
-with pd.ExcelWriter('react_credential_security.xlsx', engine='openpyxl') as writer:
-    df_storage.to_excel(writer, sheet_name='Storage Mechanisms', index=False)
-    df_vulnerabilities.to_excel(writer, sheet_name='Vulnerabilities', index=False)
-    df_auth_patterns.to_excel(writer, sheet_name='Auth Patterns', index=False)
-    df_compliance.to_excel(writer, sheet_name='Compliance', index=False)
-    df_solutions.to_excel(writer, sheet_name='Solutions', index=False)
-    df_best_practices.to_excel(writer, sheet_name='Best Practices', index=False)
-    df_performance.to_excel(writer, sheet_name='Performance', index=False)
-    
-    # Auto-adjust column widths
-    for sheet in writer.sheets.values():
-        for column in sheet.columns:
-            max_length = 0
-            column_letter = column[0].column_letter
-            for cell in column:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = min(max_length + 2, 50)
-            sheet.column_dimensions[column_letter].width = adjusted_width
-
-print("\nDataFrames exported to 'react_credential_security.xlsx'")
-
-# Create a decision matrix for React developers
-decision_matrix = pd.DataFrame({
-    'Scenario': [
-        'Simple SPA, no sensitive data',
-        'E-commerce with payments',
-        'Healthcare app (HIPAA)',
-        'Mobile app with offline needs',
-        'Enterprise B2B application',
-        'Public API integration'
-    ],
-    'Recommended Solution': [
-        'Session cookies + CSRF',
-        'BFF pattern + Auth0',
-        'Zero-knowledge + WebAuthn',
-        'react-native-keychain',
-        'Okta + certificate auth',
-        'OAuth2 PKCE flow'
-    ],
-    'Storage Mechanism': [
-        'HttpOnly cookies',
-        'Server-side only',
-        'No credential storage',
-        'Hardware secure enclave',
-        'Server sessions',
-        'Memory only'
-    ],
-    'Estimated Security Cost': [
-        '$0 (built-in)',
-        '$500-2000/month',
-        '$2000-5000/month',
-        '$0 (platform features)',
-        '$5000+/month',
-        '$0-500/month'
-    ]
-})
-
-print("\n=== DECISION MATRIX FOR REACT APPS ===")
-print(decision_matrix.to_string(index=False))
-
-# Create a migration guide
-migration_guide = pd.DataFrame({
-    'Current State': [
-        'localStorage credentials',
-        'sessionStorage tokens',
-        'Plain cookies',
-        'Client-side encryption',
-        'Long-lived tokens'
-    ],
-    'Migration Path': [
-        'Move to BFF + sessions',
-        'Implement OAuth2 PKCE',
-        'Add HttpOnly, Secure flags',
-        'Server-side encryption',
-        'Add refresh token flow'
-    ],
-    'Effort': [
-        'High (architecture change)',
-        'Medium (auth flow update)',
-        'Low (config change)',
-        'High (backend required)',
-        'Medium (token management)'
-    ],
-    'Security Improvement': [
-        '10x (eliminates XSS risk)',
-        '5x (reduces exposure)',
-        '2x (prevents JS access)',
-        '10x (proper key management)',
-        '3x (limits exposure window)'
-    ]
-})
-
-print("\n=== MIGRATION GUIDE ===")
-print(migration_guide.to_string(index=False))
+    try:
+        # Create database configuration
+        db_config = DatabaseConfig(
+            server=args.server,
+            database=args.database,
+            username=args.username,
+            password=args.password,
+            trusted_connection=not (args.username and args.password)
+        )
+        
+        # Initialize tracker
+        tracker = FileStatsTracker(db_config)
+        
+        if args.report:
+            # Generate change report
+            report = tracker.generate_change_report(args.days)
+            print(f"\nChange Report (Last {args.days} days):")
+            print(report.to_string(index=False))
+        else:
+            # Perform scan
+            scan_id, stats = tracker.scan_directory(
+                args.directory,
+                recursive=args.recursive,
+                include_hidden=args.hidden
+            )
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+# Example usage
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        main()
+    else:
+        print("File Statistics Tracker with SQL Server SCD2")
+        print("\nExample usage:")
+        print("# Initialize tracker")
+        print("db_config = DatabaseConfig(server='localhost', database='FileTracking')")
+        print("tracker = FileStatsTracker(db_config)")
+        print("\n# Scan directory")
+        print("scan_id, stats = tracker.scan_directory('/path/to/scan')")
+        print("\n# Get file history")
+        print("history = tracker.get_file_history('/path/to/specific/file.txt')")
+        print("\n# Generate change report")
+        print("changes = tracker.generate_change_report(days_back=30)")
