@@ -1,0 +1,18 @@
+# Optimizing SQL Server queries with complex left joins
+
+When dealing with SQL Server queries containing multiple left joins and subqueries, the path to optimal performance isn't always obvious. **The surprising truth: CTEs and subqueries perform identically in most cases** - SQL Server's query optimizer treats them as logical equivalents, producing the same execution plans. [sqlshack +2](https://www.sqlshack.com/why-is-my-cte-so-slow/?claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=1ae277fc-e2e2-427e-83cb-bfbf988a0951) [Microsoft Learn](https://learn.microsoft.com/en-us/sql/relational-databases/performance/intelligent-query-processing-cardinality-estimation-feedback?view=sql-server-ver16&claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=73983320-fcc5-427c-9309-15c03ee73c2f) The trade-off is higher setup cost and tempdb I/O, but for complex queries processing large datasets, the benefits far outweigh these costs.
+
+## Essential indexing strategies for left join optimization
+
+Proper indexing forms the foundation of left join performance. **Every foreign key column involved in join predicates must have an index** - this single practice can reduce query execution time by 70-90%. [GitHub +2](https://github.com/MansourJouya/SQL-Server-Optimization?claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=b1680c2b-c728-400b-ab6b-959083e1ce0e) The optimal structure places join columns first in the index key, followed by filter columns, with SELECT list columns in the INCLUDE clause: [Microsoft Learn](https://learn.microsoft.com/en-us/sql/relational-databases/sql-server-index-design-guide?view=sql-server-ver17&claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=765337b5-e6e7-42bf-8f18-30311ec1f1ff) **Batch mode adaptive joins** dynamically choose between hash and nested loop algorithms at runtime based on actual row counts, eliminating the performance penalties of poor cardinality estimates. [microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/performance/intelligent-query-processing-details?view=sql-server-ver16&claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=bc0b963a-3a78-46c0-b1d5-e93cefb3e5c2) [Microsoft Learn](https://learn.microsoft.com/en-us/sql/relational-databases/performance/intelligent-query-processing-cardinality-estimation-feedback?view=sql-server-ver16&claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=f269d880-a21d-465d-bd82-78e04b267f13) [Microsoft Learn](https://learn.microsoft.com/en-us/sql/relational-databases/performance/intelligent-query-processing-cardinality-estimation-feedback?view=sql-server-ver16&claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=9a4b6ad6-0158-41c3-b0e3-ceee0168fbb5) Configure Query Store with adequate retention to capture performance patterns:
+
+```sql
+ALTER DATABASE [YourDatabase] SET QUERY_STORE = ON 
+(
+    OPERATION_MODE = READ_WRITE,
+    MAX_STORAGE_SIZE_MB = 1000,
+    QUERY_CAPTURE_MODE = AUTO
+)
+```
+
+For complex analytical queries, **batch mode on rowstore** (SQL Server 2019+) processes data in batches of up to 900 rows instead of row-by-row, reducing CPU overhead by up to 80% without requiring columnstore indexes. [microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/performance/intelligent-query-processing-details?view=sql-server-ver16&claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=119a8a45-f332-4eaf-bc3b-5aab37144741) [Microsoft Learn](https://learn.microsoft.com/en-us/sql/relational-databases/performance/intelligent-query-processing-cardinality-estimation-feedback?view=sql-server-ver16
