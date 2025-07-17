@@ -1,18 +1,318 @@
-# Optimizing SQL Server queries with complex left joins
+import polars as pl
+import psutil
+import gc
 
-When dealing with SQL Server queries containing multiple left joins and subqueries, the path to optimal performance isn't always obvious. **The surprising truth: CTEs and subqueries perform identically in most cases** - SQL Server's query optimizer treats them as logical equivalents, producing the same execution plans. [sqlshack +2](https://www.sqlshack.com/why-is-my-cte-so-slow/?claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=1ae277fc-e2e2-427e-83cb-bfbf988a0951) [Microsoft Learn](https://learn.microsoft.com/en-us/sql/relational-databases/performance/intelligent-query-processing-cardinality-estimation-feedback?view=sql-server-ver16&claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=73983320-fcc5-427c-9309-15c03ee73c2f) The trade-off is higher setup cost and tempdb I/O, but for complex queries processing large datasets, the benefits far outweigh these costs.
+def memory_safe_explode_join_drop_csv(file1_path, file2_path, explode_column, 
+                                     file2_join_column="Acct_ID", 
+                                     output_csv="result.csv"):
+    """
+    Memory-safe version that:
+    1. Creates duplicate of specified column (keeps original as list)
+    2. Explodes the duplicate column for joining
+    3. Joins file1 (using exploded column) with file2 (using Acct_ID)
+    4. Drops the exploded column after join (keeps original list column)
+    5. Saves result as CSV
+    
+    Parameters:
+    - file1_path: Path to first parquet file
+    - file2_path: Path to second parquet file  
+    - explode_column: Column to duplicate and explode in file1
+    - file2_join_column: Join column in file2 (default: "Acct_ID")
+    - output_csv: Output CSV filename
+    """
+    
+    print("=" * 70)
+    print("MEMORY-SAFE DUPLICATE -> EXPLODE -> JOIN -> DROP -> CSV WORKFLOW")
+    print("=" * 70)
+    print(f"File1: {file1_path}")
+    print(f"File2: {file2_path}")
+    print(f"Column to duplicate and explode: {explode_column}")
+    print(f"Original list column will be retained as: {explode_column}")
+    print(f"Exploded column (temporary): {explode_column}_exploded")
+    print(f"File2 join key: {file2_join_column}")
+    print("=" * 70)
+    
+    print(f"Memory at start: {psutil.virtual_memory().percent:.1f}%")
+    
+    # Build the complete pipeline using lazy evaluation
+    print("Building lazy evaluation pipeline...")
+    
+    exploded_col_name = f"{explode_column}_exploded"
+    
+    try:
+        # Step 1: Read file1, create duplicate, and explode the duplicate
+        file1_query = (
+            pl.scan_parquet(file1_path)
+            .with_columns(
+                # Create duplicate of the column to be exploded
+                pl.col(explode_column).alias(exploded_col_name)
+            )
+            .explode(exploded_col_name)  # Explode only the duplicate
+            .with_columns(
+                # Ensure exploded column is compatible type for joining
+                pl.col(exploded_col_name).cast(pl.Float64)
+            )
+        )
+        
+        # Step 2: Read file2 and prepare for join
+        file2_query = (
+            pl.scan_parquet(file2_path)
+            .with_columns(
+                # Ensure Acct_ID is compatible type for joining
+                pl.col(file2_join_column).cast(pl.Float64)
+            )
+        )
+        
+        # Step 3: Join using different column names
+        joined_query = file1_query.join(
+            file2_query,
+            left_on=exploded_col_name,   # Use exploded duplicate column
+            right_on=file2_join_column,  # Use Acct_ID from file2
+            how="left"
+        )
+        
+        # Step 4: Drop the exploded duplicate column after join (keep original list)
+        joined_query = joined_query.drop(exploded_col_name)
+        
+        print("Executing lazy pipeline with streaming...")
+        
+        # Execute the entire pipeline with streaming for memory safety
+        result = joined_query.collect(streaming=True)
+        
+        print(f"Pipeline executed successfully!")
+        print(f"Result shape: {result.shape}")
+        print(f"Memory after processing: {psutil.virtual_memory().percent:.1f}%")
+        
+        # Step 5: Save as CSV
+        print(f"Saving result to {output_csv}...")
+        result.write_csv(output_csv)
+        
+        print(f"Memory after saving: {psutil.virtual_memory().percent:.1f}%")
+        print("=" * 70)
+        print("WORKFLOW COMPLETED SUCCESSFULLY!")
+        print(f"Final result saved to: {output_csv}")
+        print(f"✅ Original list column '{explode_column}' retained in final result")
+        print(f"✅ Exploded duplicate column '{exploded_col_name}' dropped after join")
+        print("=" * 70)
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error during processing: {e}")
+        print("Attempting memory cleanup...")
+        gc.collect()
+        raise
 
-## Essential indexing strategies for left join optimization
+# ALTERNATIVE VERSION WITH INTERMEDIATE CHECKPOINTS
+# ================================================
 
-Proper indexing forms the foundation of left join performance. **Every foreign key column involved in join predicates must have an index** - this single practice can reduce query execution time by 70-90%. [GitHub +2](https://github.com/MansourJouya/SQL-Server-Optimization?claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=b1680c2b-c728-400b-ab6b-959083e1ce0e) The optimal structure places join columns first in the index key, followed by filter columns, with SELECT list columns in the INCLUDE clause: [Microsoft Learn](https://learn.microsoft.com/en-us/sql/relational-databases/sql-server-index-design-guide?view=sql-server-ver17&claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=765337b5-e6e7-42bf-8f18-30311ec1f1ff) **Batch mode adaptive joins** dynamically choose between hash and nested loop algorithms at runtime based on actual row counts, eliminating the performance penalties of poor cardinality estimates. [microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/performance/intelligent-query-processing-details?view=sql-server-ver16&claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=bc0b963a-3a78-46c0-b1d5-e93cefb3e5c2) [Microsoft Learn](https://learn.microsoft.com/en-us/sql/relational-databases/performance/intelligent-query-processing-cardinality-estimation-feedback?view=sql-server-ver16&claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=f269d880-a21d-465d-bd82-78e04b267f13) [Microsoft Learn](https://learn.microsoft.com/en-us/sql/relational-databases/performance/intelligent-query-processing-cardinality-estimation-feedback?view=sql-server-ver16&claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=9a4b6ad6-0158-41c3-b0e3-ceee0168fbb5) Configure Query Store with adequate retention to capture performance patterns:
+def checkpoint_explode_join_drop_csv(file1_path, file2_path, explode_column,
+                                    file2_join_column="Acct_ID", 
+                                    output_csv="result.csv",
+                                    temp_dir="./temp_processing"):
+    """
+    Version with intermediate checkpoints for extra safety
+    Creates duplicate, explodes duplicate, keeps original list column
+    """
+    from pathlib import Path
+    
+    temp_path = Path(temp_dir)
+    temp_path.mkdir(exist_ok=True)
+    exploded_col_name = f"{explode_column}_exploded"
+    
+    try:
+        print("Step 1: Reading, duplicating, and exploding file1...")
+        
+        # Read file1
+        df1 = pl.read_parquet(file1_path)
+        print(f"File1 original shape: {df1.shape}")
+        
+        # Create duplicate and explode the duplicate
+        df1_with_duplicate = df1.with_columns(
+            pl.col(explode_column).alias(exploded_col_name)  # Create duplicate
+        )
+        
+        df1_exploded = df1_with_duplicate.explode(exploded_col_name)  # Explode duplicate only
+        print(f"File1 after exploding duplicate: {df1_exploded.shape}")
+        print(f"✅ Original list column '{explode_column}' preserved")
+        print(f"✅ Exploded duplicate column '{exploded_col_name}' created")
+        
+        # Type alignment for exploded column
+        df1_exploded = df1_exploded.with_columns(
+            pl.col(exploded_col_name).cast(pl.Float64)
+        )
+        
+        # Save intermediate result
+        exploded_file = temp_path / "exploded_file1.parquet"
+        df1_exploded.write_parquet(exploded_file)
+        
+        # Clean up memory
+        del df1, df1_with_duplicate, df1_exploded
+        gc.collect()
+        
+        print(f"Exploded data saved to checkpoint: {exploded_file}")
+        print(f"Memory after explode: {psutil.virtual_memory().percent:.1f}%")
+        
+        # Step 2: Join using lazy evaluation
+        print("Step 2: Performing join with type alignment...")
+        
+        joined_result = (
+            pl.scan_parquet(exploded_file)
+            .join(
+                pl.scan_parquet(file2_path)
+                .with_columns(
+                    pl.col(file2_join_column).cast(pl.Float64)
+                ),
+                left_on=exploded_col_name,     # Use exploded duplicate
+                right_on=file2_join_column,
+                how="left"
+            )
+            .drop(exploded_col_name)  # Drop only the exploded duplicate
+            .collect(streaming=True)
+        )
+        
+        print(f"Join completed. Final shape: {joined_result.shape}")
+        print(f"✅ Exploded duplicate column '{exploded_col_name}' dropped")
+        print(f"✅ Original list column '{explode_column}' retained")
+        print(f"Memory after join: {psutil.virtual_memory().percent:.1f}%")
+        
+        # Step 3: Save as CSV
+        print(f"Saving final result to {output_csv}...")
+        joined_result.write_csv(output_csv)
+        
+        print("Checkpoint-based processing completed successfully!")
+        return joined_result
+        
+    finally:
+        # Clean up temp files
+        for temp_file in temp_path.glob("*.parquet"):
+            temp_file.unlink()
+        if temp_path.exists():
+            temp_path.rmdir()
+        print("Temporary files cleaned up")
 
-```sql
-ALTER DATABASE [YourDatabase] SET QUERY_STORE = ON 
-(
-    OPERATION_MODE = READ_WRITE,
-    MAX_STORAGE_SIZE_MB = 1000,
-    QUERY_CAPTURE_MODE = AUTO
+# VALIDATION HELPER
+# ================
+
+def validate_explode_join_result(file1_path, explode_column, result_csv):
+    """
+    Validate that the duplicate/explode/join worked correctly
+    """
+    print("\nVALIDATION REPORT:")
+    print("=" * 50)
+    
+    # Read original file1 to check explode operation
+    original_df1 = pl.read_parquet(file1_path)
+    
+    # Count total elements in lists before explode
+    total_list_elements = original_df1.select(
+        pl.col(explode_column).list.len().sum()
+    ).item()
+    
+    # Read result CSV
+    result_df = pl.read_csv(result_csv)
+    result_rows = len(result_df)
+    
+    exploded_col_name = f"{explode_column}_exploded"
+    
+    print(f"Original file1 rows: {len(original_df1)}")
+    print(f"Total elements in '{explode_column}' lists: {total_list_elements}")
+    print(f"Result CSV rows: {result_rows}")
+    
+    # Check if explode worked correctly
+    if total_list_elements == result_rows:
+        print("✅ Explode operation successful - all list elements preserved")
+    else:
+        print("⚠️  Explode validation failed - row count mismatch")
+    
+    # Check if original list column was preserved
+    if explode_column in result_df.columns:
+        print(f"✅ Original list column '{explode_column}' preserved in result")
+    else:
+        print(f"⚠️  Original list column '{explode_column}' missing from result")
+    
+    # Check if exploded duplicate column was dropped
+    if exploded_col_name not in result_df.columns:
+        print(f"✅ Exploded duplicate column '{exploded_col_name}' successfully dropped")
+    else:
+        print(f"⚠️  Exploded duplicate column '{exploded_col_name}' still present in result")
+    
+    # Show final columns
+    print(f"Final columns in result: {len(result_df.columns)}")
+    print(f"Column names: {result_df.columns}")
+    
+    print("=" * 50)
+
+# USAGE EXAMPLES
+# ==============
+
+# Example 1: Basic usage - keeps original list column, explodes duplicate for joining
+result = memory_safe_explode_join_drop_csv(
+    file1_path="file1.parquet",
+    file2_path="file2.parquet", 
+    explode_column="account_list",     # Original list is preserved, duplicate is exploded
+    file2_join_column="Acct_ID",       # Join column in file2
+    output_csv="final_exploded_result.csv"
 )
-```
 
-For complex analytical queries, **batch mode on rowstore** (SQL Server 2019+) processes data in batches of up to 900 rows instead of row-by-row, reducing CPU overhead by up to 80% without requiring columnstore indexes. [microsoft](https://learn.microsoft.com/en-us/sql/relational-databases/performance/intelligent-query-processing-details?view=sql-server-ver16&claude-citation-94c9c135-77d8-4e9a-aa41-73d433e2c9ca=119a8a45-f332-4eaf-bc3b-5aab37144741) [Microsoft Learn](https://learn.microsoft.com/en-us/sql/relational-databases/performance/intelligent-query-processing-cardinality-estimation-feedback?view=sql-server-ver16
+# Example 2: Transaction processing example
+result = memory_safe_explode_join_drop_csv(
+    file1_path="transactions.parquet",
+    file2_path="accounts.parquet",
+    explode_column="transaction_ids",   # Original list kept, duplicate exploded for joining
+    file2_join_column="Acct_ID",
+    output_csv="transaction_details_with_lists.csv"
+)
+
+# Example 3: Using checkpoint version for extra safety
+result = checkpoint_explode_join_drop_csv(
+    file1_path="large_file1.parquet", 
+    file2_path="large_file2.parquet",
+    explode_column="id_list",           # List preserved, duplicate used for join
+    file2_join_column="Acct_ID",
+    output_csv="safe_checkpoint_result.csv"
+)
+
+# Example 4: Complete workflow with validation
+result = memory_safe_explode_join_drop_csv(
+    file1_path="data1.parquet",
+    file2_path="data2.parquet",
+    explode_column="customer_ids",      # Original list retained!
+    output_csv="validated_result_with_lists.csv"
+)
+
+# Validate the result
+validate_explode_join_result(
+    file1_path="data1.parquet",
+    explode_column="customer_ids",
+    result_csv="validated_result_with_lists.csv"
+)
+
+print("All examples completed!")
+
+# WHAT HAPPENS IN THE WORKFLOW:
+# ==============================
+"""
+Input file1.parquet:
+Row 1: customer_ids = [101, 102, 103], name = "John", ...
+Row 2: customer_ids = [201, 202], name = "Jane", ...
+
+Step 1 - Create duplicate:
+Row 1: customer_ids = [101, 102, 103], customer_ids_exploded = [101, 102, 103], name = "John"
+Row 2: customer_ids = [201, 202], customer_ids_exploded = [201, 202], name = "Jane"
+
+Step 2 - Explode duplicate only:
+Row 1: customer_ids = [101, 102, 103], customer_ids_exploded = 101, name = "John"
+Row 2: customer_ids = [101, 102, 103], customer_ids_exploded = 102, name = "John"  
+Row 3: customer_ids = [101, 102, 103], customer_ids_exploded = 103, name = "John"
+Row 4: customer_ids = [201, 202], customer_ids_exploded = 201, name = "Jane"
+Row 5: customer_ids = [201, 202], customer_ids_exploded = 202, name = "Jane"
+
+Step 3 - Join (customer_ids_exploded with Acct_ID from file2):
+Joins each exploded value with corresponding account details
+
+Step 4 - Drop exploded duplicate:
+Final result has customer_ids (original list) + account details, no customer_ids_exploded
+
+✅ You get both: individual account details AND the original list structure!
+"""
