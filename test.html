@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Data Storage and Retrieval Proposal</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background-color: white;
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background-color: #01528a;
+            color: white;
+            padding: 2rem;
+            text-align: center;
+            margin-bottom: 2rem;
+            border-radius: 8px;
+        }
+
+        h1 {
+            font-size: 2.2rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+
+        .proposal-overview {
+            background-color: #f0f6ff;
+            border-left: 4px solid #01528a;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            border-radius: 4px;
+        }
+
+        .section {
+            background-color: white;
+            border: 2px solid #01528a;
+            border-radius: 8px;
+            margin-bottom: 2rem;
+            overflow: hidden;
+        }
+
+        .section-header {
+            background-color: #01528a;
+            color: white;
+            padding: 1rem;
+            font-size: 1.4rem;
+            font-weight: bold;
+        }
+
+        .section-content {
+            padding: 1.5rem;
+        }
+
+        h2 {
+            color: #01528a;
+            margin-bottom: 1rem;
+            font-size: 1.3rem;
+        }
+
+        h3 {
+            color: #01528a;
+            margin-bottom: 0.8rem;
+            margin-top: 1.2rem;
+            font-size: 1.1rem;
+        }
+
+        ul, ol {
+            margin-left: 1.5rem;
+            margin-bottom: 1rem;
+        }
+
+        li {
+            margin-bottom: 0.4rem;
+        }
+
+        .highlight-box {
+            background-color: #e6f3ff;
+            border: 1px solid #01528a;
+            padding: 1rem;
+            margin: 1rem 0;
+            border-radius: 4px;
+        }
+
+        .code-block {
+            background-color: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 4px;
+            padding: 1rem;
+            font-family: 'Courier New', monospace;
+            margin: 1rem 0;
+            overflow-x: auto;
+        }
+
+        .data-flow {
+            background-color: #f0f6ff;
+            border: 2px dashed #01528a;
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+            margin: 1.5rem 0;
+        }
+
+        .approval-section {
+            background-color: #01528a;
+            color: white;
+            padding: 1.5rem;
+            text-align: center;
+            border-radius: 8px;
+            margin-top: 2rem;
+        }
+
+        .requirements-box {
+            background-color: #fff9e6;
+            border-left: 4px solid #ffa500;
+            padding: 1rem;
+            margin: 1rem 0;
+            border-radius: 4px;
+        }
+
+        strong {
+            color: #01528a;
+        }
+
+        .example {
+            background-color: #f8f9fa;
+            padding: 0.8rem;
+            margin: 0.5rem 0;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Data Storage and Retrieval Proposal</h1>
+        <p class="subtitle">Data Team Proposal for Apps Team Data Requirements</p>
+    </header>
+
+    <div class="proposal-overview">
+        <h2>Proposal Summary</h2>
+        <p><strong>Objective:</strong> Consume ~345GBs of data from SQL Developer and store as Gzip compressed parquet files in UDM Fileshare (~70-170GBs compressed). Provide on-demand data provisioning to SQL Server (DEV) for Apps Team investigations.</p>
+        
+        <div class="data-flow">
+            <strong>Data Flow:</strong> SQL Developer → <em>Weekly Automic Extraction</em> → UDM Fileshare (Parquet) → <em>On-Demand Provisioning</em> → DEV_DATABASE.dbo.ACT_ACTSUB → Apps Team Investigation → CSV Export
+        </div>
+        
+        <p><em>Visual representation of data flow from the data source to Data Team's UDM Fileshare can be found in the attached PNG file: {insert link to png here}</em></p>
+    </div>
+
+    <!-- Section 1: Data Storage (Automated) -->
+    <div class="section">
+        <div class="section-header">1. Data Storage (Automated)</div>
+        <div class="section-content">
+            <h2>How Data Will Be Stored</h2>
+            
+            <h3>Technical Implementation</h3>
+            <ul>
+                <li><strong>Platform:</strong> Python (Linux Red Hat) server</li>
+                <li><strong>Data Sources:</strong> UDM Fileshare, SQL Server (DEV), SQL Developer (Reports)</li>
+                <li><strong>Dataset:</strong> <em>ACT and ACTSUB tables as inner joined dataset</em></li>
+                <li><strong>Time Range:</strong> Mid-September 2023 - present day</li>
+                <li><strong>Partitioning:</strong> By ACTSUBD column (35 unique values)</li>
+            </ul>
+
+            <div class="highlight-box">
+                <strong>⚠️ CRITICAL:</strong> Data will be extracted <em>weekly using Automic software</em> for automated scheduling and execution.
+            </div>
+
+            <h3>Storage Details</h3>
+            <ul>
+                <li><strong>Extract Type:</strong> Full data load without modification</li>
+                <li><strong>No SCD2 or CDC events implementation</strong></li>
+                <li><strong>File Structure:</strong></li>
+            </ul>
+            
+            <div class="code-block">
+Vendor/PROD/SqlDeveloper/AppsTeam/{ACTSUBD}/year/month/day/{parquet_file_HHMMSS.parquet}
+            </div>
+
+            <div class="example">
+Examples:<br>
+Vendor/PROD/SqlDeveloper/AppsTeam/value_1/2025/May/01/value_1_125439.parquet<br>
+Vendor/PROD/SqlDeveloper/AppsTeam/value_2/2025/May/01/value_2_012513.parquet
+            </div>
+
+            <h3>When Data Is Stored</h3>
+            <div class="highlight-box">
+                <strong>Schedule:</strong> Weekly automated extraction via Automic<br>
+                <strong>Data Processing:</strong> Joined ACT and ACTSUB dataset<br>
+                <strong>Storage Location:</strong> UDM Fileshare as compressed parquet files<br>
+                <strong>Environment Note:</strong> Data marked as PROD but uploaded to DEV for query/analysis needs
+            </div>
+        </div>
+    </div>
+
+    <!-- Section 2: Data Retrieval (Manual/On-Demand) -->
+    <div class="section">
+        <div class="section-header">2. Data Retrieval (Manual/On-Demand)</div>
+        <div class="section-content">
+            <h2>How Users Can Request and Access Data</h2>
+            
+            <h3>Request Process</h3>
+            <ol>
+                <li><strong>SP Ticket Creation:</strong> Apps Team creates ticket with required information</li>
+                <li><strong>Data Provisioning:</strong> Data Team sends <em>joined dataset from UDM Fileshare to SQL Server (DEV)</em></li>
+                <li><strong>Investigation:</strong> Apps Team queries data in <strong>DEV_DATABASE.dbo.ACT_ACTSUB</strong> table</li>
+                <li><strong>CSV Export:</strong> Subset data provided as CSV for record keeping</li>
+                <li><strong>Cleanup:</strong> Data removed from SQL Server (DEV) when complete</li>
+            </ol>
+
+            <div class="requirements-box">
+                <h3>⚠️ MANDATORY - Apps Team Must Provide:</h3>
+                <ul>
+                    <li><strong>ACTSUBD Values:</strong> Specific ACTSUBD column values required</li>
+                    <li><strong>Date Range:</strong> Exact date range for data extraction</li>
+                </ul>
+                <em>Requests without these requirements will be rejected.</em>
+            </div>
+
+            <h3>Data Provisioning Details</h3>
+            <ul>
+                <li><strong>Source:</strong> UDM Fileshare (compressed parquet files)</li>
+                <li><strong>Target:</strong> <strong>DEV_DATABASE.dbo.ACT_ACTSUB</strong> table</li>
+                <li><strong>Format:</strong> <em>Joined ACT and ACTSUB dataset</em></li>
+                <li><strong>Tool:</strong> Pre-built Python script accepting ACTSUBD values and date range</li>
+                <li><strong>Additional Requests:</strong> Apps Team may request additional data during investigation</li>
+            </ul>
+
+            <div class="highlight-box">
+                <strong>CSV Output:</strong> Subset data provided as CSV for internal record keeping<br>
+                <strong>Filename Format:</strong> <code>{ACTSUBD}_{daterange}.csv</code><br>
+                <em>Reflects the specific ACTSUBD and date range requirements initially requested by Apps Team</em>
+            </div>
+
+            <h3>Investigation Support</h3>
+            <ul>
+                <li>Apps Team can make additional data requests during investigation</li>
+                <li>CSV can be provided upon request with clearly defined requirements</li>
+                <li>Data will be removed from SQL Server (DEV) once investigation is complete</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- Future Considerations -->
+    <div class="section">
+        <div class="section-header">Future Development Considerations</div>
+        <div class="section-content">
+            <h2>Potential Improvements</h2>
+            <div class="highlight-box">
+                <strong>API/Web Interface:</strong> Apps Team and Data Team may collaborate to create an API or web interface for data requests, reducing dependency on manual ticket processes.
+            </div>
+        </div>
+    </div>
+
+    <!-- Approval Section -->
+    <div class="approval-section">
+        <h2>Seeking Apps Team Approval</h2>
+        <p><strong>Next Steps:</strong> If Apps Team agrees to the terms outlined above, Data Team will proceed with building the solution in the development environment.</p>
+        <br>
+        <p><em>This proposal requires Apps Team approval to move forward with implementation.</em></p>
+    </div>
+</body>
+</html>

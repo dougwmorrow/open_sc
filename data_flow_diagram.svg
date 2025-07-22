@@ -1,0 +1,175 @@
+<svg width="1200" height="700" viewBox="0 0 1200 700" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background with subtle gradient -->
+  <defs>
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#fafbfc;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#f4f6f8;stop-opacity:1" />
+    </linearGradient>
+    
+    <!-- Drop shadow filter -->
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="rgba(0,0,0,0.1)"/>
+    </filter>
+    
+    <!-- Arrow markers -->
+    <marker id="arrowBlue" markerWidth="12" markerHeight="8" refX="11" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,8 L12,4 z" fill="#01528a"/>
+    </marker>
+    
+    <marker id="arrowOrange" markerWidth="12" markerHeight="8" refX="11" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,8 L12,4 z" fill="#ff6b35"/>
+    </marker>
+  </defs>
+  
+  <rect width="1200" height="700" fill="url(#bgGradient)"/>
+  
+  <!-- Title Section -->
+  <g id="title-section">
+    <rect x="50" y="30" width="1100" height="80" rx="12" fill="white" filter="url(#shadow)"/>
+    <text x="600" y="60" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="28" font-weight="600" fill="#01528a">Data Flow Architecture</text>
+    <text x="600" y="85" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="16" fill="#64748b">SQL Developer to UDM Fileshare to SQL Server DEV to CSV Export</text>
+  </g>
+  
+  <!-- Main Flow Container -->
+  <g id="main-flow">
+    <!-- SQL Developer -->
+    <g id="sql-developer">
+      <rect x="80" y="160" width="180" height="120" rx="16" fill="#01528a" filter="url(#shadow)"/>
+      <circle cx="170" cy="190" r="8" fill="white" opacity="0.3"/>
+      <text x="170" y="205" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="18" font-weight="600" fill="white">SQL Developer</text>
+      <text x="170" y="225" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="14" fill="#b3d9ff">Reports Database</text>
+      <rect x="100" y="240" width="140" height="25" rx="12" fill="rgba(255,255,255,0.2)"/>
+      <text x="170" y="255" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="11" font-weight="500" fill="white">ACT + ACTSUB Tables</text>
+      <text x="170" y="270" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="10" fill="#b3d9ff">345GB Source Data</text>
+    </g>
+    
+    <!-- Flow Arrow 1 -->
+    <g id="flow-1">
+      <path d="M 280 220 Q 320 220 360 220" stroke="#01528a" stroke-width="4" fill="none" marker-end="url(#arrowBlue)"/>
+      <rect x="300" y="180" width="80" height="35" rx="8" fill="white" stroke="#01528a" stroke-width="2" filter="url(#shadow)"/>
+      <text x="340" y="195" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="11" font-weight="600" fill="#01528a">Weekly</text>
+      <text x="340" y="208" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="11" font-weight="600" fill="#01528a">Automic</text>
+    </g>
+    
+    <!-- UDM Fileshare -->
+    <g id="udm-fileshare">
+      <rect x="380" y="160" width="180" height="120" rx="16" fill="#01528a" filter="url(#shadow)"/>
+      <circle cx="470" cy="190" r="8" fill="white" opacity="0.3"/>
+      <text x="470" y="205" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="18" font-weight="600" fill="white">UDM Fileshare</text>
+      <text x="470" y="225" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="14" fill="#b3d9ff">Network Storage</text>
+      <rect x="400" y="240" width="140" height="25" rx="12" fill="rgba(255,255,255,0.2)"/>
+      <text x="470" y="255" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="11" font-weight="500" fill="white">Gzip Parquet Files</text>
+      <text x="470" y="270" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="10" fill="#b3d9ff">70-170GB Compressed</text>
+    </g>
+    
+    <!-- Request Trigger -->
+    <g id="request-trigger">
+      <rect x="420" y="320" width="160" height="90" rx="12" fill="#ff6b35" filter="url(#shadow)"/>
+      <circle cx="500" cy="345" r="6" fill="white" opacity="0.8"/>
+      <text x="500" y="360" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="14" font-weight="600" fill="white">Apps Team Request</text>
+      <text x="500" y="378" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="11" fill="white">SP Ticket Required:</text>
+      <text x="500" y="392" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="10" fill="white">ACTSUBD Values</text>
+      <text x="500" y="404" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="10" fill="white">Date Range</text>
+      
+      <!-- Trigger line -->
+      <path d="M 500 320 Q 500 300 520 280" stroke="#ff6b35" stroke-width="3" stroke-dasharray="8,4" fill="none"/>
+    </g>
+    
+    <!-- Flow Arrow 2 -->
+    <g id="flow-2">
+      <path d="M 580 220 Q 620 220 660 220" stroke="#01528a" stroke-width="4" fill="none" marker-end="url(#arrowBlue)"/>
+      <rect x="600" y="180" width="80" height="35" rx="8" fill="white" stroke="#01528a" stroke-width="2" filter="url(#shadow)"/>
+      <text x="640" y="195" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="11" font-weight="600" fill="#01528a">On-Demand</text>
+      <text x="640" y="208" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="11" font-weight="600" fill="#01528a">Provision</text>
+    </g>
+    
+    <!-- SQL Server DEV -->
+    <g id="sql-server">
+      <rect x="680" y="160" width="180" height="120" rx="16" fill="#01528a" filter="url(#shadow)"/>
+      <circle cx="770" cy="190" r="8" fill="white" opacity="0.3"/>
+      <text x="770" y="205" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="18" font-weight="600" fill="white">SQL Server DEV</text>
+      <text x="770" y="225" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="14" fill="#b3d9ff">Development Database</text>
+      <rect x="700" y="240" width="140" height="25" rx="12" fill="rgba(255,255,255,0.2)"/>
+      <text x="770" y="252" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="10" font-weight="500" fill="white">DEV_DATABASE.dbo</text>
+      <text x="770" y="263" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="10" font-weight="500" fill="white">ACT_ACTSUB</text>
+      <text x="770" y="275" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="9" fill="#b3d9ff">Temporary Investigation Data</text>
+    </g>
+    
+    <!-- Flow Arrow 3 -->
+    <g id="flow-3">
+      <path d="M 880 220 Q 920 220 960 220" stroke="#01528a" stroke-width="4" fill="none" marker-end="url(#arrowBlue)"/>
+      <rect x="900" y="180" width="80" height="35" rx="8" fill="white" stroke="#01528a" stroke-width="2" filter="url(#shadow)"/>
+      <text x="940" y="195" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="11" font-weight="600" fill="#01528a">Optional</text>
+      <text x="940" y="208" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="11" font-weight="600" fill="#01528a">Export</text>
+    </g>
+    
+    <!-- CSV Export -->
+    <g id="csv-export">
+      <rect x="980" y="160" width="180" height="120" rx="16" fill="#059669" filter="url(#shadow)"/>
+      <circle cx="1070" cy="190" r="8" fill="white" opacity="0.3"/>
+      <text x="1070" y="205" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="18" font-weight="600" fill="white">CSV Export</text>
+      <text x="1070" y="225" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="14" fill="#a7f3d0">Record Keeping</text>
+      <rect x="1000" y="240" width="140" height="25" rx="12" fill="rgba(255,255,255,0.2)"/>
+      <text x="1070" y="255" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="11" font-weight="500" fill="white">ACTSUBD_daterange.csv</text>
+      <text x="1070" y="270" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="10" fill="#a7f3d0">Subset for Investigation</text>
+    </g>
+  </g>
+  
+  <!-- Process Timeline -->
+  <g id="timeline">
+    <rect x="80" y="450" width="1080" height="140" rx="16" fill="white" filter="url(#shadow)"/>
+    <text x="620" y="480" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="20" font-weight="600" fill="#01528a">Process Timeline</text>
+    
+    <!-- Timeline line -->
+    <line x1="150" y1="530" x2="1050" y2="530" stroke="#e2e8f0" stroke-width="2"/>
+    
+    <!-- Step 1 -->
+    <circle cx="200" cy="530" r="16" fill="#01528a"/>
+    <text x="200" y="536" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" font-weight="700" fill="white">1</text>
+    <text x="200" y="555" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" font-weight="600" fill="#01528a">Weekly Extract</text>
+    <text x="200" y="570" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="10" fill="#64748b">Automated via Automic</text>
+    
+    <!-- Step 2 -->
+    <circle cx="380" cy="530" r="16" fill="#01528a"/>
+    <text x="380" y="536" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" font-weight="700" fill="white">2</text>
+    <text x="380" y="555" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" font-weight="600" fill="#01528a">Store and Compress</text>
+    <text x="380" y="570" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="10" fill="#64748b">Parquet format in UDM</text>
+    
+    <!-- Step 3 -->
+    <circle cx="560" cy="530" r="16" fill="#ff6b35"/>
+    <text x="560" y="536" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" font-weight="700" fill="white">3</text>
+    <text x="560" y="555" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" font-weight="600" fill="#ff6b35">Request Data</text>
+    <text x="560" y="570" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="10" fill="#64748b">Apps Team SP ticket</text>
+    
+    <!-- Step 4 -->
+    <circle cx="740" cy="530" r="16" fill="#01528a"/>
+    <text x="740" y="536" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" font-weight="700" fill="white">4</text>
+    <text x="740" y="555" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" font-weight="600" fill="#01528a">Investigate</text>
+    <text x="740" y="570" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="10" fill="#64748b">Query DEV database</text>
+    
+    <!-- Step 5 -->
+    <circle cx="920" cy="530" r="16" fill="#059669"/>
+    <text x="920" y="536" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" font-weight="700" fill="white">5</text>
+    <text x="920" y="555" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="12" font-weight="600" fill="#059669">Export CSV</text>
+    <text x="920" y="570" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="10" fill="#64748b">Optional record keeping</text>
+    
+    <!-- Timeline arrows -->
+    <path d="M 220 530 L 360 530" stroke="#01528a" stroke-width="3" fill="none" marker-end="url(#arrowBlue)"/>
+    <path d="M 400 530 L 540 530" stroke="#01528a" stroke-width="3" fill="none" marker-end="url(#arrowOrange)"/>
+    <path d="M 580 530 L 720 530" stroke="#01528a" stroke-width="3" fill="none" marker-end="url(#arrowBlue)"/>
+    <path d="M 760 530 L 900 530" stroke="#01528a" stroke-width="3" fill="none" marker-end="url(#arrowBlue)"/>
+  </g>
+  
+  <!-- Key Information Panel -->
+  <g id="key-info">
+    <rect x="80" y="620" width="520" height="60" rx="12" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+    <text x="100" y="640" font-family="Inter, system-ui, sans-serif" font-size="12" font-weight="600" fill="#01528a">Key Information:</text>
+    <text x="100" y="655" font-family="Inter, system-ui, sans-serif" font-size="11" fill="#475569">Joined ACT + ACTSUB dataset throughout entire flow</text>
+    <text x="100" y="668" font-family="Inter, system-ui, sans-serif" font-size="11" fill="#475569">Data temporarily stored in DEV, removed after investigation</text>
+    
+    <rect x="640" y="620" width="520" height="60" rx="12" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+    <text x="660" y="640" font-family="Inter, system-ui, sans-serif" font-size="12" font-weight="600" fill="#01528a">Data Specifications:</text>
+    <text x="660" y="655" font-family="Inter, system-ui, sans-serif" font-size="11" fill="#475569">Source: 345GB to Compressed: 70-170GB (80% reduction)</text>
+    <text x="660" y="668" font-family="Inter, system-ui, sans-serif" font-size="11" fill="#475569">Partitioned by ACTSUBD column (35 unique values)</text>
+  </g>
+</svg>
