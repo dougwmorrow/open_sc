@@ -1,318 +1,404 @@
-import polars as pl
-import psutil
-import gc
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.figure_factory as ff
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.decomposition import PCA
+from scipy import stats
+from scipy.stats import entropy
+import re
+import warnings
+warnings.filterwarnings('ignore')
 
-def memory_safe_explode_join_drop_csv(file1_path, file2_path, explode_column, 
-                                     file2_join_column="Acct_ID", 
-                                     output_csv="result.csv"):
-    """
-    Memory-safe version that:
-    1. Creates duplicate of specified column (keeps original as list)
-    2. Explodes the duplicate column for joining
-    3. Joins file1 (using exploded column) with file2 (using Acct_ID)
-    4. Drops the exploded column after join (keeps original list column)
-    5. Saves result as CSV
+def optimize_dataframe_memory(df):
+    """Reduce memory usage by optimizing data types"""
+    initial_memory = df.memory_usage(deep=True).sum() / 1024**2
     
-    Parameters:
-    - file1_path: Path to first parquet file
-    - file2_path: Path to second parquet file  
-    - explode_column: Column to duplicate and explode in file1
-    - file2_join_column: Join column in file2 (default: "Acct_ID")
-    - output_csv: Output CSV filename
-    """
+    # Optimize numeric columns
+    for col in df.select_dtypes(include=['int']).columns:
+        col_min, col_max = df[col].min(), df[col].max()
+        
+        if col_min >= 0:
+            if col_max < 255:
+                df[col] = df[col].astype(np.uint8)
+            elif col_max < 65535:
+                df[col] = df[col].astype(np.uint16)
+            elif col_max < 4294967295:
+                df[col] = df[col].astype(np.uint32)
+        else:
+            if col_min > -128 and col_max < 127:
+                df[col] = df[col].astype(np.int8)
+            elif col_min > -32768 and col_max < 32767:
+                df[col] = df[col].astype(np.int16)
     
-    print("=" * 70)
-    print("MEMORY-SAFE DUPLICATE -> EXPLODE -> JOIN -> DROP -> CSV WORKFLOW")
-    print("=" * 70)
-    print(f"File1: {file1_path}")
-    print(f"File2: {file2_path}")
-    print(f"Column to duplicate and explode: {explode_column}")
-    print(f"Original list column will be retained as: {explode_column}")
-    print(f"Exploded column (temporary): {explode_column}_exploded")
-    print(f"File2 join key: {file2_join_column}")
-    print("=" * 70)
+    # Convert low-cardinality strings to category
+    for col in df.select_dtypes(include=['object']).columns:
+        if df[col].nunique() / len(df) < 0.5:
+            df[col] = df[col].astype('category')
     
-    print(f"Memory at start: {psutil.virtual_memory().percent:.1f}%")
+    final_memory = df.memory_usage(deep=True).sum() / 1024**2
+    print(f"Memory optimization: {initial_memory:.1f}MB → {final_memory:.1f}MB ({100*(initial_memory-final_memory)/initial_memory:.1f}% reduction)")
     
-    # Build the complete pipeline using lazy evaluation
-    print("Building lazy evaluation pipeline...")
-    
-    exploded_col_name = f"{explode_column}_exploded"
-    
-    try:
-        # Step 1: Read file1, create duplicate, and explode the duplicate
-        file1_query = (
-            pl.scan_parquet(file1_path)
-            .with_columns(
-                # Create duplicate of the column to be exploded
-                pl.col(explode_column).alias(exploded_col_name)
-            )
-            .explode(exploded_col_name)  # Explode only the duplicate
-            .with_columns(
-                # Ensure exploded column is compatible type for joining
-                pl.col(exploded_col_name).cast(pl.Float64)
-            )
-        )
-        
-        # Step 2: Read file2 and prepare for join
-        file2_query = (
-            pl.scan_parquet(file2_path)
-            .with_columns(
-                # Ensure Acct_ID is compatible type for joining
-                pl.col(file2_join_column).cast(pl.Float64)
-            )
-        )
-        
-        # Step 3: Join using different column names
-        joined_query = file1_query.join(
-            file2_query,
-            left_on=exploded_col_name,   # Use exploded duplicate column
-            right_on=file2_join_column,  # Use Acct_ID from file2
-            how="left"
-        )
-        
-        # Step 4: Drop the exploded duplicate column after join (keep original list)
-        joined_query = joined_query.drop(exploded_col_name)
-        
-        print("Executing lazy pipeline with streaming...")
-        
-        # Execute the entire pipeline with streaming for memory safety
-        result = joined_query.collect(streaming=True)
-        
-        print(f"Pipeline executed successfully!")
-        print(f"Result shape: {result.shape}")
-        print(f"Memory after processing: {psutil.virtual_memory().percent:.1f}%")
-        
-        # Step 5: Save as CSV
-        print(f"Saving result to {output_csv}...")
-        result.write_csv(output_csv)
-        
-        print(f"Memory after saving: {psutil.virtual_memory().percent:.1f}%")
-        print("=" * 70)
-        print("WORKFLOW COMPLETED SUCCESSFULLY!")
-        print(f"Final result saved to: {output_csv}")
-        print(f"✅ Original list column '{explode_column}' retained in final result")
-        print(f"✅ Exploded duplicate column '{exploded_col_name}' dropped after join")
-        print("=" * 70)
-        
-        return result
-        
-    except Exception as e:
-        print(f"Error during processing: {e}")
-        print("Attempting memory cleanup...")
-        gc.collect()
-        raise
+    return df
 
-# ALTERNATIVE VERSION WITH INTERMEDIATE CHECKPOINTS
-# ================================================
-
-def checkpoint_explode_join_drop_csv(file1_path, file2_path, explode_column,
-                                    file2_join_column="Acct_ID", 
-                                    output_csv="result.csv",
-                                    temp_dir="./temp_processing"):
-    """
-    Version with intermediate checkpoints for extra safety
-    Creates duplicate, explodes duplicate, keeps original list column
-    """
-    from pathlib import Path
+def comprehensive_relationship_analysis(df, col1='ACCOUNT_NUMBER', col2='ACCOUNT_ID'):
+    """Analyze the relationship between two ID columns"""
     
-    temp_path = Path(temp_dir)
-    temp_path.mkdir(exist_ok=True)
-    exploded_col_name = f"{explode_column}_exploded"
+    # Calculate bidirectional uniqueness
+    col1_to_col2 = df.groupby(col1)[col2].nunique()
+    col2_to_col1 = df.groupby(col2)[col1].nunique()
     
-    try:
-        print("Step 1: Reading, duplicating, and exploding file1...")
-        
-        # Read file1
-        df1 = pl.read_parquet(file1_path)
-        print(f"File1 original shape: {df1.shape}")
-        
-        # Create duplicate and explode the duplicate
-        df1_with_duplicate = df1.with_columns(
-            pl.col(explode_column).alias(exploded_col_name)  # Create duplicate
-        )
-        
-        df1_exploded = df1_with_duplicate.explode(exploded_col_name)  # Explode duplicate only
-        print(f"File1 after exploding duplicate: {df1_exploded.shape}")
-        print(f"✅ Original list column '{explode_column}' preserved")
-        print(f"✅ Exploded duplicate column '{exploded_col_name}' created")
-        
-        # Type alignment for exploded column
-        df1_exploded = df1_exploded.with_columns(
-            pl.col(exploded_col_name).cast(pl.Float64)
-        )
-        
-        # Save intermediate result
-        exploded_file = temp_path / "exploded_file1.parquet"
-        df1_exploded.write_parquet(exploded_file)
-        
-        # Clean up memory
-        del df1, df1_with_duplicate, df1_exploded
-        gc.collect()
-        
-        print(f"Exploded data saved to checkpoint: {exploded_file}")
-        print(f"Memory after explode: {psutil.virtual_memory().percent:.1f}%")
-        
-        # Step 2: Join using lazy evaluation
-        print("Step 2: Performing join with type alignment...")
-        
-        joined_result = (
-            pl.scan_parquet(exploded_file)
-            .join(
-                pl.scan_parquet(file2_path)
-                .with_columns(
-                    pl.col(file2_join_column).cast(pl.Float64)
-                ),
-                left_on=exploded_col_name,     # Use exploded duplicate
-                right_on=file2_join_column,
-                how="left"
-            )
-            .drop(exploded_col_name)  # Drop only the exploded duplicate
-            .collect(streaming=True)
-        )
-        
-        print(f"Join completed. Final shape: {joined_result.shape}")
-        print(f"✅ Exploded duplicate column '{exploded_col_name}' dropped")
-        print(f"✅ Original list column '{explode_column}' retained")
-        print(f"Memory after join: {psutil.virtual_memory().percent:.1f}%")
-        
-        # Step 3: Save as CSV
-        print(f"Saving final result to {output_csv}...")
-        joined_result.write_csv(output_csv)
-        
-        print("Checkpoint-based processing completed successfully!")
-        return joined_result
-        
-    finally:
-        # Clean up temp files
-        for temp_file in temp_path.glob("*.parquet"):
-            temp_file.unlink()
-        if temp_path.exists():
-            temp_path.rmdir()
-        print("Temporary files cleaned up")
-
-# VALIDATION HELPER
-# ================
-
-def validate_explode_join_result(file1_path, explode_column, result_csv):
-    """
-    Validate that the duplicate/explode/join worked correctly
-    """
-    print("\nVALIDATION REPORT:")
-    print("=" * 50)
+    # Detect relationship type
+    max_col2_per_col1 = col1_to_col2.max()
+    max_col1_per_col2 = col2_to_col1.max()
     
-    # Read original file1 to check explode operation
-    original_df1 = pl.read_parquet(file1_path)
+    def detect_type(max1, max2):
+        if max1 == 1 and max2 == 1:
+            return "One-to-One"
+        elif max1 == 1:
+            return f"Many-to-One ({col1} → {col2})"
+        elif max2 == 1:
+            return f"One-to-Many ({col1} → {col2})"
+        else:
+            return "Many-to-Many"
     
-    # Count total elements in lists before explode
-    total_list_elements = original_df1.select(
-        pl.col(explode_column).list.len().sum()
-    ).item()
+    # Calculate relationship metrics
+    n_unique_pairs = len(df[[col1, col2]].drop_duplicates())
+    total_rows = len(df)
     
-    # Read result CSV
-    result_df = pl.read_csv(result_csv)
-    result_rows = len(result_df)
+    # Cardinality analysis
+    col1_unique = df[col1].nunique()
+    col2_unique = df[col2].nunique()
     
-    exploded_col_name = f"{explode_column}_exploded"
+    # Distribution statistics
+    col1_counts = col1_to_col2.describe()
+    col2_counts = col2_to_col1.describe()
     
-    print(f"Original file1 rows: {len(original_df1)}")
-    print(f"Total elements in '{explode_column}' lists: {total_list_elements}")
-    print(f"Result CSV rows: {result_rows}")
+    results = {
+        'relationship_type': detect_type(max_col1_per_col2, max_col2_per_col1),
+        'cardinality': {
+            col1: col1_unique,
+            col2: col2_unique,
+            'ratio': col1_unique / col2_unique
+        },
+        'mapping_stats': {
+            f'{col2}_per_{col1}': {
+                'mean': col1_to_col2.mean(),
+                'max': max_col2_per_col1,
+                'std': col1_to_col2.std()
+            },
+            f'{col1}_per_{col2}': {
+                'mean': col2_to_col1.mean(), 
+                'max': max_col1_per_col2,
+                'std': col2_to_col1.std()
+            }
+        },
+        'data_completeness': {
+            f'{col1}_nulls': df[col1].isnull().sum(),
+            f'{col2}_nulls': df[col2].isnull().sum(),
+            'both_present': ((df[col1].notnull()) & (df[col2].notnull())).sum()
+        }
+    }
     
-    # Check if explode worked correctly
-    if total_list_elements == result_rows:
-        print("✅ Explode operation successful - all list elements preserved")
-    else:
-        print("⚠️  Explode validation failed - row count mismatch")
+    return results
+
+def calculate_mutual_information(df, col1='ACCOUNT_NUMBER', col2='ACCOUNT_ID'):
+    """Calculate normalized mutual information between ID columns"""
     
-    # Check if original list column was preserved
-    if explode_column in result_df.columns:
-        print(f"✅ Original list column '{explode_column}' preserved in result")
-    else:
-        print(f"⚠️  Original list column '{explode_column}' missing from result")
+    # Remove nulls and sample if too large
+    clean_df = df[[col1, col2]].dropna()
+    if len(clean_df) > 50000:
+        clean_df = clean_df.sample(50000, random_state=42)
     
-    # Check if exploded duplicate column was dropped
-    if exploded_col_name not in result_df.columns:
-        print(f"✅ Exploded duplicate column '{exploded_col_name}' successfully dropped")
-    else:
-        print(f"⚠️  Exploded duplicate column '{exploded_col_name}' still present in result")
+    # Encode IDs as integers
+    le1, le2 = LabelEncoder(), LabelEncoder()
+    encoded_col1 = le1.fit_transform(clean_df[col1].astype(str))
+    encoded_col2 = le2.fit_transform(clean_df[col2].astype(str))
     
-    # Show final columns
-    print(f"Final columns in result: {len(result_df.columns)}")
-    print(f"Column names: {result_df.columns}")
+    # Calculate mutual information
+    mi_score = mutual_info_classif(
+        encoded_col1.reshape(-1, 1), 
+        encoded_col2, 
+        discrete_features=True
+    )[0]
     
-    print("=" * 50)
+    # Calculate entropies for normalization
+    h_col1 = entropy(np.bincount(encoded_col1))
+    h_col2 = entropy(np.bincount(encoded_col2))
+    
+    # Normalized mutual information
+    normalized_mi = mi_score / min(h_col1, h_col2) if min(h_col1, h_col2) > 0 else 0
+    
+    return {
+        'mutual_information': mi_score,
+        'normalized_mi': normalized_mi,
+        'interpretation': 'Strong' if normalized_mi > 0.7 else 'Moderate' if normalized_mi > 0.3 else 'Weak'
+    }
 
-# USAGE EXAMPLES
-# ==============
+def detect_id_patterns(df, col1='ACCOUNT_NUMBER', col2='ACCOUNT_ID'):
+    """Detect patterns and transformations between ID columns"""
+    
+    # Sample for pattern analysis
+    sample = df[[col1, col2]].dropna().sample(min(5000, len(df)), random_state=42)
+    
+    # Pattern extraction
+    def extract_format_pattern(series):
+        patterns = {}
+        for value in series.astype(str):
+            # Create pattern: A for letters, 9 for digits, others as-is
+            pattern = re.sub(r'[A-Za-z]', 'A', value)
+            pattern = re.sub(r'[0-9]', '9', pattern)
+            patterns[pattern] = patterns.get(pattern, 0) + 1
+        return dict(sorted(patterns.items(), key=lambda x: x[1], reverse=True)[:5])
+    
+    # Transformation detection
+    transformations = {
+        'exact_match': 0,
+        'prefix_match': 0,
+        'suffix_match': 0,
+        'substring': 0,
+        'length_difference': []
+    }
+    
+    for _, row in sample.iterrows():
+        val1, val2 = str(row[col1]), str(row[col2])
+        
+        if val1 == val2:
+            transformations['exact_match'] += 1
+        elif len(val1) >= 3 and len(val2) >= 3:
+            if val2.startswith(val1[:3]) or val1.startswith(val2[:3]):
+                transformations['prefix_match'] += 1
+            if val2.endswith(val1[-3:]) or val1.endswith(val2[-3:]):
+                transformations['suffix_match'] += 1
+            if val1 in val2 or val2 in val1:
+                transformations['substring'] += 1
+        
+        transformations['length_difference'].append(len(val1) - len(val2))
+    
+    # Convert to percentages
+    sample_size = len(sample)
+    for key in ['exact_match', 'prefix_match', 'suffix_match', 'substring']:
+        transformations[key] = (transformations[key] / sample_size) * 100
+    
+    transformations['avg_length_diff'] = np.mean(transformations['length_difference'])
+    del transformations['length_difference']
+    
+    return {
+        'patterns': {
+            col1: extract_format_pattern(sample[col1]),
+            col2: extract_format_pattern(sample[col2])
+        },
+        'transformations': transformations
+    }
 
-# Example 1: Basic usage - keeps original list column, explodes duplicate for joining
-result = memory_safe_explode_join_drop_csv(
-    file1_path="file1.parquet",
-    file2_path="file2.parquet", 
-    explode_column="account_list",     # Original list is preserved, duplicate is exploded
-    file2_join_column="Acct_ID",       # Join column in file2
-    output_csv="final_exploded_result.csv"
-)
+def validate_id_quality(df, col1='ACCOUNT_NUMBER', col2='ACCOUNT_ID'):
+    """Comprehensive data quality validation for ID columns"""
+    
+    quality_issues = {}
+    
+    # Basic quality metrics
+    for col in [col1, col2]:
+        col_data = df[col]
+        quality_issues[col] = {
+            'null_count': col_data.isnull().sum(),
+            'null_percentage': (col_data.isnull().sum() / len(df)) * 100,
+            'empty_strings': (col_data == '').sum() if col_data.dtype == 'object' else 0,
+            'duplicate_count': col_data.duplicated().sum(),
+            'unique_ratio': col_data.nunique() / len(col_data.dropna())
+        }
+    
+    # Cross-column consistency
+    both_null = (df[col1].isnull()) & (df[col2].isnull())
+    one_null = ((df[col1].isnull()) & (df[col2].notnull())) | ((df[col1].notnull()) & (df[col2].isnull()))
+    
+    quality_issues['consistency'] = {
+        'both_null_count': both_null.sum(),
+        'one_null_count': one_null.sum(),
+        'consistency_ratio': (len(df) - one_null.sum()) / len(df)
+    }
+    
+    return quality_issues
 
-# Example 2: Transaction processing example
-result = memory_safe_explode_join_drop_csv(
-    file1_path="transactions.parquet",
-    file2_path="accounts.parquet",
-    explode_column="transaction_ids",   # Original list kept, duplicate exploded for joining
-    file2_join_column="Acct_ID",
-    output_csv="transaction_details_with_lists.csv"
-)
+def create_relationship_visualizations(df, col1='ACCOUNT_NUMBER', col2='ACCOUNT_ID'):
+    """Create visualizations for ID relationships"""
+    
+    # Sample for visualization if dataset is large
+    viz_df = df[[col1, col2]].dropna()
+    if len(viz_df) > 10000:
+        viz_df = viz_df.sample(10000, random_state=42)
+    
+    # 1. Cardinality comparison
+    fig1 = go.Figure(data=[
+        go.Bar(name='Unique Values', 
+               x=[col1, col2], 
+               y=[df[col1].nunique(), df[col2].nunique()]),
+        go.Bar(name='Total Records', 
+               x=[col1, col2], 
+               y=[len(df), len(df)], 
+               opacity=0.3)
+    ])
+    fig1.update_layout(title='Cardinality Comparison', barmode='group')
+    
+    # 2. Relationship mapping distribution
+    col1_to_col2_counts = df.groupby(col1)[col2].nunique()
+    col2_to_col1_counts = df.groupby(col2)[col1].nunique()
+    
+    fig2 = make_subplots(rows=1, cols=2, 
+                        subplot_titles=[f'{col2}s per {col1}', f'{col1}s per {col2}'])
+    
+    fig2.add_trace(go.Histogram(x=col1_to_col2_counts, name=f'{col2}s per {col1}'), row=1, col=1)
+    fig2.add_trace(go.Histogram(x=col2_to_col1_counts, name=f'{col1}s per {col2}'), row=1, col=2)
+    fig2.update_layout(title='Relationship Distribution')
+    
+    # 3. Data completeness heatmap
+    completeness = pd.DataFrame({
+        'Column': [col1, col2],
+        'Complete': [df[col1].notnull().sum(), df[col2].notnull().sum()],
+        'Missing': [df[col1].isnull().sum(), df[col2].isnull().sum()]
+    })
+    
+    fig3 = px.bar(completeness, x='Column', y=['Complete', 'Missing'], 
+                  title='Data Completeness', barmode='stack')
+    
+    return {'cardinality': fig1, 'distribution': fig2, 'completeness': fig3}
 
-# Example 3: Using checkpoint version for extra safety
-result = checkpoint_explode_join_drop_csv(
-    file1_path="large_file1.parquet", 
-    file2_path="large_file2.parquet",
-    explode_column="id_list",           # List preserved, duplicate used for join
-    file2_join_column="Acct_ID",
-    output_csv="safe_checkpoint_result.csv"
-)
+def create_sankey_flow_diagram(df, col1='ACCOUNT_NUMBER', col2='ACCOUNT_ID', max_nodes=50):
+    """Create Sankey diagram showing ID relationships"""
+    
+    # Aggregate relationships and limit to top connections
+    flow_data = df.groupby([col1, col2]).size().reset_index(name='count')
+    flow_data = flow_data.nlargest(max_nodes, 'count')
+    
+    # Get unique values for nodes
+    all_col1_vals = flow_data[col1].unique()
+    all_col2_vals = flow_data[col2].unique()
+    
+    # Create node labels and indices
+    node_labels = [f"{col1}_{v}" for v in all_col1_vals] + [f"{col2}_{v}" for v in all_col2_vals]
+    
+    # Create mapping dictionaries
+    col1_indices = {val: i for i, val in enumerate(all_col1_vals)}
+    col2_indices = {val: i + len(all_col1_vals) for i, val in enumerate(all_col2_vals)}
+    
+    # Create Sankey diagram
+    fig = go.Figure(data=[go.Sankey(
+        node=dict(
+            pad=15,
+            thickness=20,
+            line=dict(color="black", width=0.5),
+            label=node_labels,
+            color="blue"
+        ),
+        link=dict(
+            source=[col1_indices[row[col1]] for _, row in flow_data.iterrows()],
+            target=[col2_indices[row[col2]] for _, row in flow_data.iterrows()],
+            value=flow_data['count'].tolist()
+        ))])
+    
+    fig.update_layout(
+        title_text=f"ID Relationship Flow: {col1} → {col2} (Top {max_nodes} connections)", 
+        font_size=10,
+        height=600
+    )
+    
+    return fig
 
-# Example 4: Complete workflow with validation
-result = memory_safe_explode_join_drop_csv(
-    file1_path="data1.parquet",
-    file2_path="data2.parquet",
-    explode_column="customer_ids",      # Original list retained!
-    output_csv="validated_result_with_lists.csv"
-)
+def analyze_id_overlap_patterns(df, col1='ACCOUNT_NUMBER', col2='ACCOUNT_ID'):
+    """Analyze overlap and intersection patterns between ID columns"""
+    
+    # Convert to sets for analysis
+    set1 = set(df[col1].dropna().astype(str))
+    set2 = set(df[col2].dropna().astype(str))
+    
+    # Calculate overlaps
+    intersection = set1.intersection(set2)
+    union = set1.union(set2)
+    
+    # Jaccard similarity
+    jaccard = len(intersection) / len(union) if len(union) > 0 else 0
+    
+    # Analyze numeric vs string patterns
+    def analyze_format(s):
+        numeric_count = sum(1 for x in s if str(x).replace('.', '').replace('-', '').isdigit())
+        return {
+            'numeric_percentage': (numeric_count / len(s)) * 100 if len(s) > 0 else 0,
+            'avg_length': np.mean([len(str(x)) for x in s]) if len(s) > 0 else 0
+        }
+    
+    format1 = analyze_format(set1)
+    format2 = analyze_format(set2)
+    
+    overlap_analysis = {
+        'set_sizes': {col1: len(set1), col2: len(set2)},
+        'intersection_size': len(intersection),
+        'jaccard_similarity': jaccard,
+        'overlap_percentage': (len(intersection) / min(len(set1), len(set2))) * 100 if min(len(set1), len(set2)) > 0 else 0,
+        'format_analysis': {col1: format1, col2: format2},
+        'sample_intersection': list(intersection)[:10] if intersection else []
+    }
+    
+    return overlap_analysis
 
-# Validate the result
-validate_explode_join_result(
-    file1_path="data1.parquet",
-    explode_column="customer_ids",
-    result_csv="validated_result_with_lists.csv"
-)
+def generate_summary_report(df, col1='ACCOUNT_NUMBER', col2='ACCOUNT_ID'):
+    """Generate comprehensive summary of ID relationship analysis"""
+    
+    print("=== ID RELATIONSHIP ANALYSIS SUMMARY ===")
+    
+    # Basic stats
+    relationship_stats = comprehensive_relationship_analysis(df, col1, col2)
+    print(f"\nRelationship Type: {relationship_stats['relationship_type']}")
+    print(f"Cardinality Ratio ({col1}/{col2}): {relationship_stats['cardinality']['ratio']:.2f}")
+    
+    # Mutual information
+    mi_results = calculate_mutual_information(df, col1, col2)
+    print(f"Mutual Information: {mi_results['normalized_mi']:.3f} ({mi_results['interpretation']})")
+    
+    # Quality summary
+    quality = validate_id_quality(df, col1, col2)
+    print(f"\nData Quality:")
+    print(f"  {col1} - Nulls: {quality[col1]['null_percentage']:.1f}%, Unique Ratio: {quality[col1]['unique_ratio']:.3f}")
+    print(f"  {col2} - Nulls: {quality[col2]['null_percentage']:.1f}%, Unique Ratio: {quality[col2]['unique_ratio']:.3f}")
+    
+    # Overlap analysis
+    overlap = analyze_id_overlap_patterns(df, col1, col2)
+    print(f"\nOverlap Analysis:")
+    print(f"  Jaccard Similarity: {overlap['jaccard_similarity']:.3f}")
+    print(f"  Direct Overlap: {overlap['overlap_percentage']:.1f}%")
+    
+    return {
+        'relationship': relationship_stats,
+        'mutual_information': mi_results,
+        'quality': quality,
+        'overlap': overlap
+    }
 
-print("All examples completed!")
-
-# WHAT HAPPENS IN THE WORKFLOW:
-# ==============================
-"""
-Input file1.parquet:
-Row 1: customer_ids = [101, 102, 103], name = "John", ...
-Row 2: customer_ids = [201, 202], name = "Jane", ...
-
-Step 1 - Create duplicate:
-Row 1: customer_ids = [101, 102, 103], customer_ids_exploded = [101, 102, 103], name = "John"
-Row 2: customer_ids = [201, 202], customer_ids_exploded = [201, 202], name = "Jane"
-
-Step 2 - Explode duplicate only:
-Row 1: customer_ids = [101, 102, 103], customer_ids_exploded = 101, name = "John"
-Row 2: customer_ids = [101, 102, 103], customer_ids_exploded = 102, name = "John"  
-Row 3: customer_ids = [101, 102, 103], customer_ids_exploded = 103, name = "John"
-Row 4: customer_ids = [201, 202], customer_ids_exploded = 201, name = "Jane"
-Row 5: customer_ids = [201, 202], customer_ids_exploded = 202, name = "Jane"
-
-Step 3 - Join (customer_ids_exploded with Acct_ID from file2):
-Joins each exploded value with corresponding account details
-
-Step 4 - Drop exploded duplicate:
-Final result has customer_ids (original list) + account details, no customer_ids_exploded
-
-✅ You get both: individual account details AND the original list structure!
-"""
+def full_id_analysis_pipeline(df, col1='ACCOUNT_NUMBER', col2='ACCOUNT_ID'):
+    """Complete analysis pipeline for ID relationships"""
+    
+    print("Starting comprehensive ID analysis...")
+    
+    # Step 1: Optimize memory
+    df_optimized = optimize_dataframe_memory(df.copy())
+    
+    # Step 2: Generate summary report
+    summary = generate_summary_report(df_optimized, col1, col2)
+    
+    # Step 3: Pattern detection
+    patterns = detect_id_patterns(df_optimized, col1, col2)
+    
+    # Step 4: Create visualizations
+    visualizations = create_relationship_visualizations(df_optimized, col1, col2)
+    sankey = create_sankey_flow_diagram(df_optimized, col1, col2)
+    
+    print("\nAnalysis complete. Results stored in returned dictionary.")
+    
+    return {
+        'summary': summary,
+        'patterns': patterns,
+        'visualizations': visualizations,
+        'sankey_diagram': sankey,
+        'optimized_dataframe': df_optimized
+    }
