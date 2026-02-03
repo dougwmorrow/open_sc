@@ -1,0 +1,338 @@
+# Production-grade SCD2 pipelines in SQL Server at scale
+
+Implementing SCD2 with a truncate/reload staging pattern at **20 million records across 300 tables** requires three key architectural decisions: compute row hashes in staging (not bronze), use separate UPDATE/INSERT statements instead of MERGE for performance, and implement metadata-driven table processing. The fundamental challenge—detecting inserts, updates, and deletes from full snapshots—is best solved with hash-based change detection using a FULL OUTER JOIN between staging and current dimension records. This approach can process 20M records in under an hour when properly batched.
+
+---
+
+## Staging layer design that enables efficient SCD2
+
+The staging layer serves as the comparison baseline for change detection. Since you're using truncate/reload, the staging table must capture everything needed to identify what changed since yesterday's snapshot.
+
+**Essential metadata columns for staging tables:**
+
+```sql
+CREATE TABLE staging.customers (
+    -- Source business columns (mirror source exactly)
+    customer_id         INT NOT NULL,
+    customer_name       NVARCHAR(100),
+    address             NVARCHAR(255),
+    city                NVARCHAR(50),
+    
+    -- ETL metadata columns
+    _batch_id           BIGINT NOT NULL,           -- Links to ETL run log
+    _load_timestamp     DATETIME2 DEFAULT SYSDATETIME(),
+    _source_system      VARCHAR(50),               -- Origin system identifier
+    
+    -- Change detection hash (persisted computed column)
+    _row_hash AS HASHBYTES('SHA2_256',
+        CONCAT_WS('|',
+            ISNULL(CAST(customer_name AS NVARCHAR(100)), '^^'),
+            ISNULL(CAST(address AS NVARCHAR(255)), '^^'),
+            ISNULL(CAST(city AS NVARCHAR(50)), '^^')
+        )
+    ) PERSISTED
+);
+```
+
+**Compute hashes in staging, not bronze.** This is a critical design decision—persisted computed columns calculate the hash once at INSERT time, avoiding repeated computation during the comparison phase. Storing hashes in staging also provides an audit trail for debugging change detection issues.
+
+The **NULL handling pattern** using `ISNULL(..., '^^')` with the `CONCAT_WS` delimiter prevents subtle bugs where `NULL` values propagate incorrectly through concatenation. Without this, rows with different NULL patterns can produce identical hashes. The `'^^'` marker is arbitrary but should be a value that never appears in your data.
+
+**Which columns to hash:** Include only business attributes that should trigger a new SCD2 version—not operational metadata like timestamps. If certain attributes should update in place (SCD1 behavior), exclude them from the hash and handle them separately.
+
+---
+
+## Change detection with full snapshots
+
+With truncate/reload staging, you must detect three change types: inserts (new business keys), updates (existing keys with changed attributes), and deletes (keys present in dimension but absent from staging). The FULL OUTER JOIN pattern handles all three:
+
+```sql
+WITH change_detection AS (
+    SELECT 
+        COALESCE(s.customer_id, d.customer_id) AS customer_id,
+        CASE 
+            WHEN d.customer_id IS NULL THEN 'INSERT'
+            WHEN s.customer_id IS NULL THEN 'DELETE'
+            WHEN s._row_hash <> d._row_hash THEN 'UPDATE'
+            ELSE 'NO_CHANGE'
+        END AS change_type,
+        s._row_hash AS new_hash,
+        d.customer_sk AS existing_sk
+    FROM staging.customers s
+    FULL OUTER JOIN bronze.dim_customer d 
+        ON s.customer_id = d.customer_id 
+        AND d.is_current = 1
+)
+SELECT * FROM change_detection 
+WHERE change_type <> 'NO_CHANGE';
+```
+
+**The deleted record problem** deserves special attention. Records disappearing from source snapshots could indicate actual deletion, late-arriving data, source system errors, or business rule exclusions. Implement **soft deletes with a grace period**:
+
+```sql
+-- Add these columns to your dimension table
+is_deleted      BIT DEFAULT 0,
+deleted_at      DATETIME2 NULL
+
+-- Apply soft delete during SCD2 processing
+UPDATE bronze.dim_customer
+SET is_current = 0,
+    eff_end_date = @effective_date,
+    is_deleted = 1,
+    deleted_at = SYSDATETIME()
+WHERE customer_id NOT IN (SELECT customer_id FROM staging.customers)
+  AND is_current = 1;
+```
+
+Consider adding a **delete threshold check**—if more than 5-10% of records suddenly disappear, halt processing and alert. This catches source system failures that would otherwise corrupt your dimension.
+
+---
+
+## SQL Server implementation patterns
+
+**Avoid MERGE for production SCD2.** Despite its elegant syntax, MERGE has significant issues at scale: [LinkedIn](https://www.linkedin.com/posts/brentozar_how-to-write-a-merge-statement-in-t-sql-activity-6777123957318533120-R0tr) approximately **40% slower** than separate statements according to practitioner benchmarks, numerous documented bugs [Brent Ozar Unlimited®](https://www.brentozar.com/archive/2017/07/peoples-blog-posts-talk/) (particularly with indexed views), race condition vulnerabilities without `HOLDLOCK`, [Michael J. Swart](https://michaeljswart.com/2021/08/what-to-avoid-if-you-want-to-use-merge/) and unpredictable query plans with poor cardinality estimation. Microsoft's own documentation now warns against MERGE for high-concurrency scenarios.
+
+**The recommended UPDATE + INSERT pattern:**
+
+```sql
+DECLARE @batch_id BIGINT = (SELECT MAX(run_id) FROM etl_run_log);
+DECLARE @effective_date DATE = CAST(GETDATE() AS DATE);
+
+BEGIN TRANSACTION;
+
+-- Step 1: Identify changes (into indexed temp table)
+CREATE TABLE #changes (
+    customer_id INT PRIMARY KEY,
+    change_type CHAR(1),  -- I=Insert, U=Update, D=Delete
+    new_hash VARBINARY(32)
+);
+
+INSERT INTO #changes
+SELECT 
+    COALESCE(s.customer_id, d.customer_id),
+    CASE 
+        WHEN d.customer_id IS NULL THEN 'I'
+        WHEN s.customer_id IS NULL THEN 'D'
+        ELSE 'U'
+    END,
+    s._row_hash
+FROM staging.customers s
+FULL OUTER JOIN bronze.dim_customer d 
+    ON s.customer_id = d.customer_id AND d.is_current = 1
+WHERE d.customer_id IS NULL 
+   OR s.customer_id IS NULL 
+   OR s._row_hash <> d._row_hash;
+
+-- Step 2: Close existing records for updates and deletes
+UPDATE d
+SET eff_end_date = DATEADD(day, -1, @effective_date),
+    is_current = 0,
+    _updated_batch_id = @batch_id
+FROM bronze.dim_customer d
+INNER JOIN #changes c ON d.customer_id = c.customer_id
+WHERE d.is_current = 1 
+  AND c.change_type IN ('U', 'D');
+
+-- Step 3: Insert new versions
+INSERT INTO bronze.dim_customer (
+    customer_id, customer_name, address, city,
+    eff_start_date, is_current, _row_hash, _created_batch_id
+)
+SELECT 
+    s.customer_id, s.customer_name, s.address, s.city,
+    @effective_date, 1, s._row_hash, @batch_id
+FROM staging.customers s
+INNER JOIN #changes c ON s.customer_id = c.customer_id
+WHERE c.change_type IN ('I', 'U');
+
+-- Step 4: Mark deletes
+UPDATE d
+SET is_deleted = 1, deleted_at = SYSDATETIME()
+FROM bronze.dim_customer d
+INNER JOIN #changes c ON d.customer_id = c.customer_id
+WHERE c.change_type = 'D';
+
+COMMIT TRANSACTION;
+DROP TABLE #changes;
+```
+
+---
+
+## Indexing and performance optimization
+
+**Dimension table structure with optimal indexing:**
+
+```sql
+CREATE TABLE bronze.dim_customer (
+    customer_sk         BIGINT IDENTITY(1,1),
+    customer_id         INT NOT NULL,              -- Business key
+    customer_name       NVARCHAR(100),
+    address             NVARCHAR(255),
+    city                NVARCHAR(50),
+    eff_start_date      DATE NOT NULL,
+    eff_end_date        DATE NULL,                 -- NULL = current
+    is_current          BIT NOT NULL DEFAULT 1,
+    is_deleted          BIT NOT NULL DEFAULT 0,
+    _row_hash           VARBINARY(32),
+    _created_batch_id   BIGINT,
+    _updated_batch_id   BIGINT,
+    
+    CONSTRAINT PK_dim_customer PRIMARY KEY CLUSTERED (customer_sk),
+    CONSTRAINT CK_date_order CHECK (eff_end_date IS NULL OR eff_start_date < eff_end_date)
+);
+
+-- Critical: Filtered index for current record lookups
+CREATE UNIQUE NONCLUSTERED INDEX IX_dim_customer_current
+ON bronze.dim_customer (customer_id)
+INCLUDE (_row_hash, customer_name, address, city)
+WHERE is_current = 1;
+
+-- For point-in-time queries
+CREATE NONCLUSTERED INDEX IX_dim_customer_history
+ON bronze.dim_customer (customer_id, eff_start_date, eff_end_date);
+```
+
+The **filtered index on `is_current = 1`** is essential—it dramatically reduces the comparison surface from potentially hundreds of millions of historical records to just the ~20M current records. The `INCLUDE` clause covers common query patterns without key lookups.
+
+**Batch processing for 20M records:** Never process all records in a single transaction. Use **10,000-50,000 row batches** to avoid lock escalation and transaction log pressure:
+
+```sql
+DECLARE @batch_size INT = 50000;
+DECLARE @rows_affected INT = 1;
+
+WHILE @rows_affected > 0
+BEGIN
+    BEGIN TRANSACTION;
+    
+    UPDATE TOP (@batch_size) d
+    SET eff_end_date = DATEADD(day, -1, @effective_date),
+        is_current = 0,
+        _updated_batch_id = @batch_id
+    FROM bronze.dim_customer d
+    INNER JOIN #changes c ON d.customer_id = c.customer_id
+    WHERE d.is_current = 1 
+      AND c.change_type IN ('U', 'D')
+      AND d._updated_batch_id IS NULL;  -- Track processed rows
+    
+    SET @rows_affected = @@ROWCOUNT;
+    COMMIT TRANSACTION;
+END
+```
+
+For tables exceeding **100M rows**, consider **partitioning by effective date** or implementing **clustered columnstore indexes** for the historical portion while keeping a rowstore index for current-record lookups.
+
+---
+
+## Processing 300 tables with metadata-driven architecture
+
+A metadata-driven approach eliminates repetitive code and enables parallel processing:
+
+```sql
+CREATE TABLE etl.table_config (
+    config_id               INT IDENTITY(1,1) PRIMARY KEY,
+    source_schema           NVARCHAR(128),
+    source_table            NVARCHAR(128),
+    target_schema           NVARCHAR(128),
+    target_table            NVARCHAR(128),
+    business_key_columns    NVARCHAR(500),    -- Comma-separated
+    hash_columns            NVARCHAR(MAX),     -- Columns for change detection
+    processing_priority     INT DEFAULT 100,   -- Lower = process first
+    is_enabled              BIT DEFAULT 1,
+    last_processed          DATETIME2,
+    avg_row_count           BIGINT,
+    avg_duration_seconds    INT
+);
+```
+
+**Group tables by dependency level and volume.** Process independent tables in parallel waves. Tables with foreign key relationships to other dimensions must wait for parent dimensions to complete.
+
+For SQL Server, use **SQL Agent jobs** or call stored procedures from your Python orchestrator. Create a generic stored procedure that accepts `config_id` and dynamically generates the SCD2 logic based on metadata configuration.
+
+**Parallelization strategy:** With 300 tables at 20M total records, you likely have many small tables and a few large ones. Process small tables (under 100K rows) in parallel batches of 10-20, while large tables get dedicated processing windows with their own batching.
+
+---
+
+## Python vs SQL decision framework
+
+**Use SQL for all heavy SCD2 operations.** A benchmark comparison showed SQL completing a 7.5M row SCD2 operation in **40.9 seconds** versus Python's **591 seconds**—a 14.5x speedup. [Medium](https://medium.com/data-science/python-vs-sql-comparison-for-data-pipelines-8ca727b34032) The data is already in SQL Server; moving it to Python for transformation, then back, adds unnecessary overhead.
+
+**Use Python for:**
+- Orchestration and workflow management (Airflow, Dagster, Prefect)
+- Loading data from APIs or files into staging
+- Complex data quality checks with Great Expectations
+- Alerting, logging, and metadata management
+- Generating dynamic SQL from configuration
+
+**Recommended hybrid architecture:**
+
+```python
+def run_scd2_pipeline():
+    batch_id = create_batch_record()
+    
+    # Python: Load staging (truncate/reload from source)
+    load_staging_tables(batch_id)
+    
+    # SQL: Execute SCD2 transformations
+    for config in get_enabled_tables():
+        execute_sql_procedure('usp_process_scd2', config.config_id, batch_id)
+    
+    # Python: Run quality checks
+    run_quality_validations(batch_id)
+    
+    # Python: Update metadata and alert on anomalies
+    finalize_batch(batch_id)
+```
+
+Polars excels at file processing and can efficiently load data into staging, but delegate the comparison and MERGE logic to SQL Server where the data already lives.
+
+---
+
+## Avoiding common SCD2 pitfalls
+
+**Not every dimension needs SCD2.** Over-engineering is the most common anti-pattern. Before implementing SCD2, confirm the business actually needs historical tracking. If they don't query historical states, daily snapshots may be simpler and cheaper—especially in cloud environments where storage is inexpensive.
+
+**The simplicity vs complexity trade-off:**
+
+| Approach | When to use | Query complexity |
+|----------|-------------|------------------|
+| SCD2 | Regulatory audit requirements, temporal analysis | High (date-range joins) |
+| Daily snapshots | Simple backfills, time-travel queries | Low (filter on date) |
+| SCD1 only | Corrections without history needs | Lowest |
+
+**Late-arriving data** requires explicit handling. If a dimension record arrives after related facts, you need either placeholder records (with `-1` surrogate key) that get updated later, or a reconciliation process that updates fact foreign keys when dimensions arrive late. [LeapFrogBI](https://www.leapfrogbi.com/updates/late-arriving-dimensions/)
+
+**Idempotency considerations:** SCD2 is inherently **not idempotent** because it modifies existing records. If your pipeline fails mid-run and you rerun it, you risk creating duplicate versions. Solutions include:
+- Using batch_id to identify and rollback partial runs
+- Implementing checkpoint tables that track which business keys were processed
+- Wrapping entire table processing in transactions with proper error handling
+
+**Temporal integrity validation:** Add post-processing checks to catch date range gaps or overlaps:
+
+```sql
+-- Check for overlapping date ranges (data quality issue)
+SELECT a.customer_id, a.eff_start_date, a.eff_end_date
+FROM bronze.dim_customer a
+JOIN bronze.dim_customer b 
+    ON a.customer_id = b.customer_id
+    AND a.customer_sk <> b.customer_sk
+    AND a.eff_start_date < ISNULL(b.eff_end_date, '9999-12-31')
+    AND ISNULL(a.eff_end_date, '9999-12-31') > b.eff_start_date;
+```
+
+---
+
+## Recommended implementation sequence
+
+For a new SCD2 implementation at this scale, build incrementally:
+
+1. **Week 1-2:** Implement staging layer with metadata columns and row hashes for 5 pilot tables
+2. **Week 3:** Build the generic SCD2 stored procedure with UPDATE/INSERT pattern (not MERGE)
+3. **Week 4:** Add metadata-driven configuration and test with 20 tables
+4. **Week 5:** Implement batching, parallel processing, and quality checks
+5. **Week 6:** Roll out to remaining 280 tables in waves of 50
+
+Monitor **change detection rates** (what percentage of records change daily), **processing duration trends**, and **dimension growth rates**. A well-tuned SCD2 pipeline processing 20M records should complete in 30-60 minutes with proper indexing and batching.
+
+## Conclusion
+
+The most impactful optimizations for your specific constraints are: computing row hashes as persisted columns in staging, using filtered indexes on `is_current = 1`, implementing separate UPDATE/INSERT instead of MERGE, and processing in 50K-row batches. The metadata-driven approach for 300 tables pays dividends in maintainability—configuration changes don't require code changes. Start simple, validate with pilot tables, and add complexity only when the business case demands it.
