@@ -1,0 +1,847 @@
+# Building High-Performance CDC→SCD2→Medallion Pipelines at Scale
+
+Implementing Slowly Changing Dimension Type 2 in a medallion architecture requires careful orchestration across four distinct layers. **The most critical insight from this research**: Bronze should implement SCD2 through hash-based change detection against an optimally-designed Stage layer, using separate INSERT/UPDATE statements rather than MERGE for tables exceeding 100 million rows. Source extraction without CDC capabilities demands timestamp-based watermarks where possible, falling back to ORA_ROWSCN for Oracle and rowversion for SQL Server when modification timestamps don't exist.
+
+This guide provides complete patterns for implementing CDC, SCD2, and medallion architecture targeting **SQL Server** as the data warehouse, with **Python** for extraction and **BCP** for bulk loading, under the constraint that source Oracle and SQL Server databases cannot be modified.
+
+---
+
+## Stage layer table design optimizes downstream SCD2 processing
+
+The Stage layer serves as the CDC landing zone where raw extracts arrive before Bronze layer processing. [Baremon](https://www.baremon.eu/staging-tables-in-database-administration/) Optimal Stage table design dramatically impacts SCD2 merge performance and change detection accuracy.
+
+### Essential metadata columns for every Stage table
+
+Every Stage table requires these metadata columns for full traceability and efficient downstream processing:
+
+```sql
+CREATE TABLE stage.Customer (
+    -- Audit/Metadata Columns
+    _record_id          BIGINT IDENTITY(1,1) NOT NULL,
+    _extracted_at       DATETIME2(3) NOT NULL,           -- When extracted from source
+    _loaded_at          DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    _batch_id           BIGINT NOT NULL,                 -- Run identifier
+    _source_system      VARCHAR(50) NOT NULL,            -- 'ORACLE_ERP', 'SQLSERVER_CRM'
+    _source_table       VARCHAR(128) NOT NULL DEFAULT 'Customer',
+    
+    -- Business Key (preserve source format)
+    CustomerID          NVARCHAR(50) NOT NULL,
+    
+    -- Source Data Columns (flexible types for schema evolution)
+    CustomerName        NVARCHAR(500) NULL,
+    Email               NVARCHAR(255) NULL,
+    Address             NVARCHAR(1000) NULL,
+    ModifiedDate        VARCHAR(50) NULL,                -- Validate in Bronze
+    
+    -- Hash Column for Change Detection
+    _row_hash           BINARY(32) NULL,                 -- Computed post-load
+    
+    CONSTRAINT PK_Stage_Customer PRIMARY KEY NONCLUSTERED (_record_id)
+);
+
+-- Minimal indexing for Bronze merge lookups
+CREATE NONCLUSTERED INDEX IX_Stage_Customer_BK 
+ON stage.Customer (CustomerID) 
+INCLUDE (_row_hash, _extracted_at);
+```
+
+**Hash computation belongs in Stage, not Bronze.** Computing the hash during Stage load enables bulk UPDATE operations leveraging SQL Server's set-based processing, allows the hash to be reused across multiple downstream processes, and keeps Bronze merge operations simpler by directly comparing pre-computed hashes. [telefonicatech](https://telefonicatech.uk/blog/hashing-for-change-detection-in-sql-server/)
+
+### Hash-based change detection patterns
+
+Use **SHA2_256 via HASHBYTES** for change detection—it's the safest forward-compatible choice since Microsoft deprecated MD5, SHA1, and earlier algorithms for cryptographic use in SQL Server 2016+. [Mssqlserver](https://mssqlserver.dev/compare-and-find-row-changes-in-sql-server-with-checksum-binarychecksum-hashbytes)
+
+**Critical NULL handling**: Both CONCAT and CONCAT_WS have NULL handling issues that cause hash collisions: [MSSQLTips](https://www.mssqltips.com/sqlservertip/6991/sql-concatenate-examples/)
+
+```sql
+-- DANGER: These produce identical hashes!
+HASHBYTES('SHA2_256', CONCAT('AB', NULL))      -- Result: 'AB'
+HASHBYTES('SHA2_256', CONCAT('A', 'B'))        -- Result: 'AB'
+
+-- CORRECT pattern: Explicit ISNULL with delimiters
+UPDATE stage.Customer
+SET _row_hash = HASHBYTES('SHA2_256',
+    CONCAT_WS('|',
+        ISNULL(CustomerName, ''),
+        ISNULL(Email, ''),
+        ISNULL(Address, ''),
+        ISNULL(CONVERT(NVARCHAR(30), ModifiedDate, 121), '')
+        -- Exclude: _extracted_at, _batch_id (metadata)
+        -- Exclude: CustomerID (compared separately as business key)
+    )
+)
+WHERE _batch_id = @CurrentBatchId;
+```
+
+Always use **pipe delimiters** between columns to prevent boundary collisions, convert dates with **explicit ISO format** (`CONVERT(NVARCHAR(30), DateCol, 121)`), and exclude audit columns from the hash.
+
+### Truncate-and-reload versus append-only patterns
+
+| Pattern | Stage Behavior | Best For | Delete Detection |
+|---------|---------------|----------|------------------|
+| **Truncate-Reload** | TRUNCATE → INSERT | Small-medium tables, no source CDC | Natural (missing = deleted) |
+| **Append-Only** | INSERT only with CDC flags | Large tables with source CDC | Requires operation flags |
+
+**Truncate-and-reload is recommended for most scenarios** because it simplifies delete detection (missing records in snapshot = candidates for expiration), provides consistent point-in-time snapshots, enables rerunnable ETL, and doesn't depend on source-side CDC capabilities.
+
+For truncate-reload patterns:
+- Drop non-clustered indexes before load, recreate after
+- Use FILLFACTOR = 100 (no page splits expected)
+- Partitioning is typically unnecessary for transient staging
+
+---
+
+## SCD2 implementation in Bronze handles history at scale
+
+The Bronze layer implements full history tracking with surrogate keys, effective dates, and current record flags. For tables with billions of records, the implementation pattern significantly impacts performance.
+
+### Bronze SCD2 table structure
+
+```sql
+CREATE TABLE bronze.DimCustomer (
+    -- Surrogate Key (BIGINT IDENTITY handles billions)
+    CustomerSK          BIGINT IDENTITY(1,1) PRIMARY KEY CLUSTERED,
+    
+    -- Business/Natural Key
+    CustomerID          NVARCHAR(50) NOT NULL,
+    
+    -- Tracked Attributes
+    CustomerName        NVARCHAR(500) NULL,
+    Email               NVARCHAR(255) NULL,
+    Address             NVARCHAR(1000) NULL,
+    
+    -- Hash for Change Detection
+    _row_hash           BINARY(32) NOT NULL,
+    
+    -- SCD2 Control Columns
+    _valid_from         DATE NOT NULL,
+    _valid_to           DATE NOT NULL DEFAULT '9999-12-31',    -- Use high date, not NULL
+    _is_current         BIT NOT NULL DEFAULT 1,
+    
+    -- Audit Columns
+    _created_batch_id   BIGINT NOT NULL,
+    _updated_batch_id   BIGINT NULL,
+    _created_at         DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    
+    -- Constraints
+    CONSTRAINT CK_DimCustomer_DateRange CHECK (_valid_from < _valid_to)
+);
+
+-- Critical indexes for SCD2 query patterns
+CREATE NONCLUSTERED INDEX IX_DimCustomer_Current 
+ON bronze.DimCustomer (CustomerID, _is_current) 
+INCLUDE (CustomerSK, _row_hash, _valid_from)
+WHERE _is_current = 1;
+
+CREATE NONCLUSTERED INDEX IX_DimCustomer_DateRange 
+ON bronze.DimCustomer (CustomerID, _valid_from, _valid_to);
+```
+
+**Use '9999-12-31' rather than NULL for _valid_to** because it simplifies fact table joins (`WHERE FactDate BETWEEN _valid_from AND _valid_to`), avoids NULL handling complexity in queries, and makes the _is_current flag technically redundant but keep it for filtered index performance. [Ayc-data](https://ayc-data.com/analytics_engineering/2020/05/27/data-modelling-kimball-10-tips.html)
+
+### Separate INSERT/UPDATE outperforms MERGE for large tables
+
+For tables exceeding **100 million records**, separate statements with explicit transactions consistently outperform MERGE:
+
+```sql
+DECLARE @Today DATE = CAST(GETUTCDATE() AS DATE);
+DECLARE @Yesterday DATE = DATEADD(DAY, -1, @Today);
+DECLARE @BatchId BIGINT = (SELECT MAX(batch_id) FROM stage.Customer);
+
+BEGIN TRANSACTION;
+BEGIN TRY
+    -- Step 1: Identify changed records using hash comparison
+    SELECT 
+        SRC.CustomerID, SRC.CustomerName, SRC.Email, SRC.Address,
+        SRC._row_hash, TGT.CustomerSK AS OldSK
+    INTO #ChangedRecords
+    FROM stage.Customer SRC
+    INNER JOIN bronze.DimCustomer TGT 
+        ON SRC.CustomerID = TGT.CustomerID 
+        AND TGT._is_current = 1
+    WHERE TGT._row_hash <> SRC._row_hash;
+
+    -- Step 2: Expire old records (set-based update)
+    UPDATE TGT
+    SET _valid_to = @Yesterday,
+        _is_current = 0,
+        _updated_batch_id = @BatchId
+    FROM bronze.DimCustomer TGT
+    INNER JOIN #ChangedRecords CHG ON TGT.CustomerSK = CHG.OldSK;
+
+    -- Step 3: Insert new versions for changed records
+    INSERT INTO bronze.DimCustomer 
+        (CustomerID, CustomerName, Email, Address, _row_hash, 
+         _valid_from, _valid_to, _is_current, _created_batch_id)
+    SELECT CustomerID, CustomerName, Email, Address, _row_hash,
+           @Today, '9999-12-31', 1, @BatchId
+    FROM #ChangedRecords;
+
+    -- Step 4: Insert brand new records
+    INSERT INTO bronze.DimCustomer 
+        (CustomerID, CustomerName, Email, Address, _row_hash,
+         _valid_from, _valid_to, _is_current, _created_batch_id)
+    SELECT SRC.CustomerID, SRC.CustomerName, SRC.Email, SRC.Address, 
+           SRC._row_hash, @Today, '9999-12-31', 1, @BatchId
+    FROM stage.Customer SRC
+    WHERE NOT EXISTS (
+        SELECT 1 FROM bronze.DimCustomer TGT 
+        WHERE TGT.CustomerID = SRC.CustomerID
+    );
+
+    -- Step 5: Handle deletes (records in Bronze but not in Stage)
+    UPDATE TGT
+    SET _valid_to = @Yesterday,
+        _is_current = 0,
+        _updated_batch_id = @BatchId
+    FROM bronze.DimCustomer TGT
+    WHERE TGT._is_current = 1
+      AND NOT EXISTS (
+          SELECT 1 FROM stage.Customer SRC 
+          WHERE SRC.CustomerID = TGT.CustomerID
+      );
+
+    COMMIT TRANSACTION;
+END TRY
+BEGIN CATCH
+    ROLLBACK TRANSACTION;
+    THROW;
+END CATCH;
+```
+
+### Batch processing for billions of records
+
+Process large SCD2 updates in chunks of **100,000-500,000 rows** to avoid lock escalation and transaction log bloat:
+
+```sql
+DECLARE @BatchSize INT = 100000;
+DECLARE @RowsAffected INT = 1;
+
+WHILE @RowsAffected > 0
+BEGIN
+    BEGIN TRANSACTION;
+    
+    UPDATE TOP (@BatchSize) TGT
+    SET _valid_to = @Yesterday, 
+        _is_current = 0,
+        _updated_batch_id = @BatchId
+    FROM bronze.DimCustomer TGT
+    INNER JOIN #ChangedRecords CHG ON TGT.CustomerSK = CHG.OldSK
+    WHERE TGT._is_current = 1;  -- Prevents re-processing
+    
+    SET @RowsAffected = @@ROWCOUNT;
+    
+    COMMIT TRANSACTION;
+    CHECKPOINT;  -- Allow log truncation between batches
+END;
+```
+
+### Handling critical edge cases
+
+**Late-arriving data** requires "splicing" records into existing history:
+
+```sql
+-- Find version active at the late-arriving effective date
+UPDATE bronze.DimCustomer
+SET _valid_to = @LateArrivingEffectiveDate
+WHERE CustomerID = @CustomerID
+  AND @LateArrivingEffectiveDate >= _valid_from 
+  AND @LateArrivingEffectiveDate < _valid_to;
+
+-- Insert late-arriving record with proper date range
+INSERT INTO bronze.DimCustomer (...)
+VALUES (..., @LateArrivingEffectiveDate, @OriginalValidTo, ...);
+```
+
+**Record resurrection** (deleted records reappearing): Add an `_is_deleted` flag and track soft deletes separately from _is_current, inserting resurrected records as new versions.
+
+**Same-day multiple changes**: Use CDC sequence numbers or precise timestamps in staging, then deduplicate keeping only the latest per business key:
+
+```sql
+WITH RankedChanges AS (
+    SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY CustomerID ORDER BY _cdc_timestamp DESC
+    ) AS rn
+    FROM stage.Customer
+)
+SELECT * INTO #LatestChanges FROM RankedChanges WHERE rn = 1;
+```
+
+### Temporal integrity validation queries
+
+Run these validations after each SCD2 load:
+
+```sql
+-- Detect gaps in date ranges
+WITH DateRanges AS (
+    SELECT CustomerID, _valid_from, _valid_to,
+           LEAD(_valid_from) OVER (PARTITION BY CustomerID ORDER BY _valid_from) AS NextFrom
+    FROM bronze.DimCustomer
+)
+SELECT CustomerID, _valid_to AS GapStart, NextFrom AS GapEnd
+FROM DateRanges
+WHERE NextFrom IS NOT NULL AND _valid_to < NextFrom;
+
+-- Detect overlaps
+SELECT A.CustomerID, A.CustomerSK, B.CustomerSK
+FROM bronze.DimCustomer A
+INNER JOIN bronze.DimCustomer B 
+    ON A.CustomerID = B.CustomerID AND A.CustomerSK < B.CustomerSK
+WHERE A._valid_from < B._valid_to AND A._valid_to > B._valid_from;
+
+-- Detect multiple current records per business key
+SELECT CustomerID, COUNT(*) AS CurrentCount
+FROM bronze.DimCustomer
+WHERE _is_current = 1
+GROUP BY CustomerID
+HAVING COUNT(*) > 1;
+```
+
+---
+
+## Source extraction strategies without modifying source databases
+
+The critical constraint—no DDL changes to source Oracle and SQL Server databases—eliminates standard CDC mechanisms like Oracle GoldenGate, SQL Server CDC tables, and triggers. Several viable alternatives exist.
+
+### Timestamp-based watermark extraction
+
+When source tables have reliable modification timestamps, this is the most efficient approach:
+
+```python
+import cx_Oracle  # or oracledb for newer versions
+import pyodbc
+from datetime import datetime, timedelta
+
+def extract_delta_oracle(dsn, username, password, table_name, 
+                         timestamp_col, last_watermark, buffer_minutes=5):
+    """Extract changed rows using timestamp watermark with safety buffer"""
+    conn = cx_Oracle.connect(username, password, dsn)
+    cursor = conn.cursor()
+    cursor.arraysize = 10000  # Batch fetch size
+    
+    # Apply safety buffer for clock skew and in-flight transactions
+    safe_watermark = datetime.utcnow() - timedelta(minutes=buffer_minutes)
+    
+    query = f"""
+        SELECT * FROM {table_name}
+        WHERE {timestamp_col} > :last_wm 
+          AND {timestamp_col} <= :safe_wm
+        ORDER BY {timestamp_col}
+    """
+    cursor.execute(query, {'last_wm': last_watermark, 'safe_wm': safe_watermark})
+    
+    while True:
+        rows = cursor.fetchmany(10000)
+        if not rows:
+            break
+        yield rows, safe_watermark
+    
+    cursor.close()
+    conn.close()
+```
+
+**Critical**: Always add a **5-minute safety buffer** to handle clock skew between servers and transactions that commit after extraction starts.
+
+### Oracle-specific extraction patterns
+
+**ORA_ROWSCN for change detection** (no DDL required):
+
+```sql
+-- Query changes since last extraction SCN
+SELECT ORA_ROWSCN, t.* 
+FROM schema.table_name t
+WHERE ORA_ROWSCN > :last_extracted_scn;
+
+-- Get current SCN for next extraction
+SELECT current_scn FROM v$database;
+```
+
+**Important limitation**: ORA_ROWSCN has **block-level granularity by default**—multiple rows in the same block share the same SCN, causing false positives. Row-level tracking requires the ROWDEPENDENCIES clause (a DDL change you cannot make). [Dbaora](https://dbaora.com/ora_rowscn-norowdependencies-rowdependencies-in-oracle/) This is acceptable for smaller tables but inefficient for very large tables.
+
+**ROWID-based parallel extraction** for billion-row tables:
+
+```python
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import cx_Oracle
+
+def get_rowid_ranges(conn, owner, table_name):
+    """Calculate ROWID ranges from extent information"""
+    cursor = conn.cursor()
+    query = """
+        SELECT 
+            DBMS_ROWID.ROWID_CREATE(1, o.data_object_id, e.relative_fno, e.block_id, 0),
+            DBMS_ROWID.ROWID_CREATE(1, o.data_object_id, e.relative_fno, 
+                                    e.block_id + e.blocks - 1, 32767)
+        FROM dba_extents e
+        JOIN dba_objects o ON e.owner = o.owner AND e.segment_name = o.object_name
+        WHERE e.owner = :owner AND e.segment_name = :table_name
+        ORDER BY e.block_id
+    """
+    cursor.execute(query, {'owner': owner, 'table_name': table_name})
+    return cursor.fetchall()
+
+def extract_chunk(dsn, username, password, table_name, start_rowid, end_rowid):
+    """Extract single ROWID chunk"""
+    conn = cx_Oracle.connect(username, password, dsn)
+    cursor = conn.cursor()
+    cursor.arraysize = 50000
+    
+    query = f"""
+        SELECT * FROM {table_name}
+        WHERE ROWID BETWEEN :start_rid AND :end_rid
+    """
+    cursor.execute(query, {'start_rid': start_rowid, 'end_rid': end_rowid})
+    return cursor.fetchall()
+
+def parallel_extract(dsn, username, password, owner, table_name, max_workers=8):
+    """Parallel extraction using ROWID ranges"""
+    conn = cx_Oracle.connect(username, password, dsn)
+    ranges = get_rowid_ranges(conn, owner, table_name)
+    conn.close()
+    
+    all_data = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(extract_chunk, dsn, username, password, 
+                          table_name, start, end)
+            for start, end in ranges
+        ]
+        for future in as_completed(futures):
+            all_data.extend(future.result())
+    
+    return all_data
+```
+
+**Oracle Flashback queries** for point-in-time extraction (if UNDO retention allows):
+
+```sql
+-- Query as of specific timestamp (no locks, consistent read)
+SELECT * FROM schema.table_name 
+AS OF TIMESTAMP TO_TIMESTAMP('2026-02-03 10:00:00', 'YYYY-MM-DD HH24:MI:SS');
+
+-- Track all changes in time window using VERSIONS
+SELECT primary_key, VERSIONS_OPERATION, col1, col2
+FROM schema.table_name
+VERSIONS BETWEEN TIMESTAMP 
+    TO_TIMESTAMP('2026-02-02 00:00:00', 'YYYY-MM-DD HH24:MI:SS') 
+    AND TO_TIMESTAMP('2026-02-03 00:00:00', 'YYYY-MM-DD HH24:MI:SS')
+WHERE VERSIONS_OPERATION IS NOT NULL;
+```
+
+### SQL Server-specific extraction patterns
+
+**Rowversion columns** (if tables already have them—no DDL to use existing columns):
+
+```python
+import pyodbc
+
+def extract_by_rowversion(conn_string, table_name, rv_column, last_rv):
+    """Extract changes using existing rowversion column"""
+    conn = pyodbc.connect(conn_string, autocommit=False)
+    cursor = conn.cursor()
+    
+    # Get safe upper bound (excludes in-flight transactions)
+    cursor.execute("SELECT MIN_ACTIVE_ROWVERSION()")
+    current_rv = cursor.fetchone()[0]
+    
+    query = f"""
+        SELECT * FROM {table_name}
+        WHERE {rv_column} > ? AND {rv_column} < ?
+        ORDER BY {rv_column}
+    """
+    cursor.execute(query, (last_rv, current_rv))
+    
+    while True:
+        rows = cursor.fetchmany(10000)
+        if not rows:
+            break
+        yield rows, current_rv
+```
+
+**Snapshot isolation for consistent reads** (if already enabled on database):
+
+```python
+def extract_with_snapshot(conn_string, query):
+    """Use snapshot isolation for consistent point-in-time reads"""
+    conn = pyodbc.connect(conn_string, autocommit=False)
+    cursor = conn.cursor()
+    
+    cursor.execute("SET TRANSACTION ISOLATION LEVEL SNAPSHOT")
+    cursor.execute("BEGIN TRANSACTION")
+    
+    try:
+        cursor.execute(query)
+        while True:
+            rows = cursor.fetchmany(10000)
+            if not rows:
+                break
+            yield rows
+        cursor.execute("COMMIT")
+    except:
+        cursor.execute("ROLLBACK")
+        raise
+```
+
+### Full-table hash comparison fallback
+
+When no change tracking mechanism exists:
+
+```sql
+-- SQL Server: HASHBYTES for row comparison
+SELECT primary_key_col,
+       HASHBYTES('SHA2_256', 
+           CONCAT_WS('|', col1, col2, ISNULL(col3, ''))) AS row_hash
+FROM source_table;
+
+-- Oracle: STANDARD_HASH (12c+)
+SELECT primary_key_col,
+       STANDARD_HASH(col1 || '|' || col2 || '|' || col3, 'SHA256') AS row_hash
+FROM source_table;
+```
+
+Compare hashes in chunks by primary key ranges to handle large tables efficiently.
+
+---
+
+## BCP optimization delivers maximum bulk load throughput
+
+BCP (Bulk Copy Program) provides the fastest path for loading extracted data into SQL Server Stage tables.
+
+### Optimal BCP command configuration
+
+```bash
+bcp DatabaseName.stage.Customer in C:\data\customer_extract.dat ^
+    -n ^                              # Native format (fastest)
+    -b 500000 ^                       # Batch size: 500K rows
+    -h "TABLOCK,ORDER(CustomerID)" ^  # Table lock + ordering hint
+    -a 65535 ^                        # Max packet size (64KB)
+    -e error.log ^                    # Error file
+    -m 1000 ^                         # Max errors before abort
+    -S ServerName ^
+    -T                                # Trusted connection
+```
+
+**Key parameters explained**:
+- **`-n` (native format)**: 200-400% faster than character format for large datasets—use when source and target are both SQL Server
+- **`-b 500000` (batch size)**: 100,000-1,000,000 rows per batch balances transaction log management and lock duration
+- **`-h "TABLOCK"`**: **Critical for minimal logging**—acquires table-level lock enabling bulk-logged operations
+- **`-h "ORDER(column)"`**: Enables sorted inserts matching clustered index, avoiding sorts during load
+
+### Minimal logging prerequisites
+
+All conditions must be met for minimal logging:
+1. Recovery model: **SIMPLE or BULK_LOGGED**
+2. TABLOCK hint specified
+3. Target table has no triggers
+4. Not published for transactional replication
+5. Empty table, or non-empty heap (non-empty clustered index is fully logged unless using TF 610/SQL 2016+)
+
+```sql
+-- Switch to BULK_LOGGED for load window
+ALTER DATABASE YourDB SET RECOVERY BULK_LOGGED;
+
+-- Disable non-clustered indexes before load
+ALTER INDEX ALL ON stage.Customer DISABLE;
+
+-- Perform BCP load
+-- ...
+
+-- Rebuild indexes
+ALTER INDEX ALL ON stage.Customer REBUILD WITH (ONLINE = ON, MAXDOP = 4);
+
+-- Return to FULL recovery
+ALTER DATABASE YourDB SET RECOVERY FULL;
+BACKUP LOG YourDB TO DISK = '...';
+```
+
+### Parallel BCP loading
+
+Split source files and run concurrent BCP sessions:
+
+```python
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+
+def run_bcp(file_path, table_name, server, batch_size=500000):
+    """Execute single BCP load"""
+    cmd = [
+        'bcp', f'DatabaseName.stage.{table_name}', 'in', file_path,
+        '-n', '-b', str(batch_size), '-h', 'TABLOCK',
+        '-S', server, '-T'
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return {'file': file_path, 'success': result.returncode == 0, 
+            'output': result.stdout}
+
+def parallel_bcp_load(file_paths, table_name, server, max_workers=4):
+    """Load multiple file splits in parallel"""
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(run_bcp, fp, table_name, server) 
+            for fp in file_paths
+        ]
+        return [f.result() for f in futures]
+```
+
+**Requirements for parallel loads into same table**: TABLOCK hint, table has no indexes OR table is empty, BULK_LOGGED or SIMPLE recovery model.
+
+---
+
+## Airflow orchestration manages complex pipeline dependencies
+
+Apache Airflow coordinates the multi-layer medallion pipeline with hundreds of tables.
+
+### Dynamic DAG generation for hundreds of tables
+
+```python
+from airflow import DAG
+from airflow.decorators import task, task_group
+from datetime import datetime, timedelta
+
+default_args = {
+    'owner': 'data_team',
+    'depends_on_past': False,
+    'retries': 3,
+    'retry_delay': timedelta(minutes=5),
+}
+
+@task
+def load_stage(table_name: str, **context) -> dict:
+    """Extract and BCP load to staging"""
+    batch_id = context['dag_run'].run_id
+    rows = execute_extraction(table_name)
+    execute_bcp_load(table_name, batch_id)
+    return {'table': table_name, 'rows': rows, 'batch_id': batch_id}
+
+@task
+def load_bronze(stage_result: dict, **context):
+    """Apply SCD2 merge from Stage to Bronze"""
+    execute_scd2_merge(
+        table=stage_result['table'],
+        batch_id=stage_result['batch_id']
+    )
+
+@task
+def load_silver(table_name: str, **context):
+    """Business transformations from Bronze to Silver"""
+    execute_silver_transform(table_name)
+
+with DAG(
+    'medallion_pipeline',
+    default_args=default_args,
+    schedule_interval='@daily',
+    catchup=True,  # Enable backfill
+    max_active_runs=3,
+) as dag:
+    
+    # Dynamic task mapping for multiple tables
+    tables = ['customers', 'orders', 'products', 'transactions']
+    
+    stage_results = load_stage.expand(table_name=tables)
+    bronze_tasks = load_bronze.expand(stage_result=stage_results)
+    silver_tasks = load_silver.expand(table_name=tables)
+    
+    bronze_tasks >> silver_tasks
+```
+
+### Idempotent delete-then-insert pattern
+
+Ensure re-runnable pipelines without duplicates:
+
+```sql
+-- Batch tracking table
+CREATE TABLE control.BatchLog (
+    BatchID NVARCHAR(100) PRIMARY KEY,  -- Airflow run_id
+    TableName NVARCHAR(128),
+    LoadDate DATE,
+    RowsLoaded INT,
+    Status VARCHAR(20),
+    StartTime DATETIME2,
+    EndTime DATETIME2
+);
+
+-- Idempotent load pattern
+BEGIN TRANSACTION;
+
+DELETE FROM stage.Customer WHERE _batch_id = @BatchId;
+
+BULK INSERT stage.Customer
+FROM '\\path\to\file.csv'
+WITH (TABLOCK, FIRSTROW = 2, FIELDTERMINATOR = ',');
+
+UPDATE control.BatchLog 
+SET Status = 'Complete', RowsLoaded = @@ROWCOUNT, EndTime = GETUTCDATE()
+WHERE BatchID = @BatchId;
+
+COMMIT TRANSACTION;
+```
+
+---
+
+## Comparing Kimball, Data Vault, and Lakehouse approaches
+
+Each methodology offers distinct advantages applicable to the medallion pattern.
+
+### Hybrid approach recommendation
+
+The optimal architecture combines best practices from all three methodologies:
+
+| Concept | Source | Application in Medallion |
+|---------|--------|--------------------------|
+| Surrogate keys | Kimball | BIGINT IDENTITY in Bronze SCD2 tables |
+| Five SCD2 columns | Kimball | valid_from, valid_to, is_current, batch_id, row_hash |
+| Insert-only Bronze | Data Vault | Append raw data with metadata, never update |
+| HashDiff | Data Vault | HASHBYTES for efficient change detection |
+| MERGE patterns | Lakehouse | Batch processing in Bronze/Silver transitions |
+| Partition by is_current | Databricks | Filtered indexes on _is_current = 1 |
+
+### Anti-patterns to avoid
+
+**Schema design mistakes**:
+- Using NULL for end dates without careful handling (complicates joins)
+- Overlapping date ranges (causes duplicate records in fact joins) [Wikipedia](https://en.wikipedia.org/wiki/Slowly_changing_dimension)
+- Tracking every attribute with SCD2 (determine which truly need history) [Benny Austin](https://bennyaustin.com/2015/10/12/type2scd-ap/)
+- Smart keys containing natural keys (fragile when sources change) [kimballgroup](https://www.kimballgroup.com/2008/09/slowly-changing-dimensions-part-2/)
+
+**Performance anti-patterns**:
+- Row-by-row processing instead of set-based operations [AWS](https://aws.amazon.com/blogs/big-data/implement-a-slowly-changing-dimension-in-amazon-redshift/)
+- Missing filtered indexes on _is_current = 1
+- Using MERGE carelessly for very large tables (documented issues in SQL Server)
+- Not partitioning by load date for maintenance operations
+
+**Bronze layer anti-patterns**:
+- Transforming data in Bronze (should be immutable/append-only)
+- Overwriting records (prevents replay and debugging)
+- Missing source metadata (loses audit trail)
+
+---
+
+## Complete end-to-end pipeline example
+
+### Python extraction orchestrator
+
+```python
+class MedallionPipeline:
+    """Complete extraction-to-SCD2 pipeline"""
+    
+    def __init__(self, source_config, target_config):
+        self.source = source_config
+        self.target = target_config
+        
+    def run_table(self, table_config, batch_id):
+        """Process single table through all layers"""
+        table_name = table_config['table_name']
+        
+        # 1. Extract from source
+        if table_config.get('watermark_column'):
+            data, new_watermark = self.extract_delta(table_config)
+        else:
+            data = self.extract_full(table_config)
+            
+        # 2. Write to staging file
+        staging_file = f"/tmp/{table_name}_{batch_id}.dat"
+        self.write_bcp_format(data, staging_file, table_config)
+        
+        # 3. BCP load to Stage
+        self.execute_bcp(staging_file, f"stage.{table_name}")
+        
+        # 4. Compute hashes in Stage
+        self.compute_stage_hashes(table_name, batch_id, table_config)
+        
+        # 5. Execute SCD2 merge to Bronze
+        self.execute_scd2_merge(table_name, batch_id)
+        
+        # 6. Update watermark
+        if table_config.get('watermark_column'):
+            self.update_watermark(table_name, new_watermark)
+            
+    def compute_stage_hashes(self, table_name, batch_id, config):
+        """Compute row hashes in Stage table"""
+        hash_columns = config['hash_columns']
+        concat_expr = "CONCAT_WS('|', " + ", ".join(
+            f"ISNULL(CAST({col} AS NVARCHAR(MAX)), '')" 
+            for col in hash_columns
+        ) + ")"
+        
+        sql = f"""
+            UPDATE stage.{table_name}
+            SET _row_hash = HASHBYTES('SHA2_256', {concat_expr})
+            WHERE _batch_id = ?
+        """
+        self.execute_target(sql, [batch_id])
+```
+
+### SQL Server SCD2 stored procedure
+
+```sql
+CREATE PROCEDURE bronze.usp_SCD2_Merge
+    @TableName NVARCHAR(128),
+    @BatchId NVARCHAR(100)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @Today DATE = CAST(GETUTCDATE() AS DATE);
+    DECLARE @Yesterday DATE = DATEADD(DAY, -1, @Today);
+    DECLARE @SQL NVARCHAR(MAX);
+    
+    -- Dynamic SQL for flexibility across tables
+    SET @SQL = N'
+    BEGIN TRANSACTION;
+    BEGIN TRY
+        -- Identify changes
+        SELECT SRC.*, TGT.' + @TableName + 'SK AS OldSK
+        INTO #Changed
+        FROM stage.' + @TableName + ' SRC
+        INNER JOIN bronze.' + @TableName + ' TGT 
+            ON SRC.BusinessKey = TGT.BusinessKey AND TGT._is_current = 1
+        WHERE TGT._row_hash <> SRC._row_hash;
+        
+        -- Expire changed records
+        UPDATE TGT
+        SET _valid_to = @Yesterday, _is_current = 0, _updated_batch_id = @BatchId
+        FROM bronze.' + @TableName + ' TGT
+        INNER JOIN #Changed C ON TGT.' + @TableName + 'SK = C.OldSK;
+        
+        -- Insert new versions
+        INSERT INTO bronze.' + @TableName + ' (...)
+        SELECT ... FROM #Changed;
+        
+        -- Insert new records
+        INSERT INTO bronze.' + @TableName + ' (...)
+        SELECT ... FROM stage.' + @TableName + ' SRC
+        WHERE NOT EXISTS (SELECT 1 FROM bronze.' + @TableName + ' WHERE BusinessKey = SRC.BusinessKey);
+        
+        -- Handle deletes
+        UPDATE TGT
+        SET _valid_to = @Yesterday, _is_current = 0, _updated_batch_id = @BatchId
+        FROM bronze.' + @TableName + ' TGT
+        WHERE TGT._is_current = 1
+          AND NOT EXISTS (SELECT 1 FROM stage.' + @TableName + ' WHERE BusinessKey = TGT.BusinessKey);
+        
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH';
+    
+    EXEC sp_executesql @SQL, 
+        N'@Yesterday DATE, @BatchId NVARCHAR(100), @Today DATE',
+        @Yesterday, @BatchId, @Today;
+END;
+```
+
+---
+
+## Summary of key recommendations
+
+**Stage layer design**: Include `_extracted_at`, `_loaded_at`, `_batch_id`, `_source_system`, and `_row_hash` columns. Compute SHA2_256 hashes with explicit NULL handling and pipe delimiters. Use truncate-and-reload for most tables.
+
+**Bronze SCD2 implementation**: Use BIGINT IDENTITY surrogate keys, '9999-12-31' for open-ended dates, and filtered indexes on `_is_current = 1`. For tables over 100M rows, use separate INSERT/UPDATE statements with batch processing (100K-500K rows) rather than MERGE.
+
+**Source extraction**: Prefer timestamp-based watermarks with 5-minute safety buffers. For Oracle without timestamps, use ORA_ROWSCN (accepting block-level granularity) or ROWID-based parallel extraction. For SQL Server, leverage existing rowversion columns or snapshot isolation.
+
+**BCP loading**: Use native format (`-n`), 500K batch sizes, TABLOCK hint, and BULK_LOGGED recovery model. Disable non-clustered indexes during load and rebuild after.
+
+**Orchestration**: Implement delete-then-insert idempotency patterns with batch ID tracking. Use Airflow dynamic task mapping for parallel table processing with proper dependency management between medallion layers.
