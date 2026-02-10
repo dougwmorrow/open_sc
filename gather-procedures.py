@@ -6,7 +6,17 @@ import re
 # Connection settings
 SERVER = "your_server"
 DATABASE = "your_database"
-CONN_STR = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SERVER};DATABASE={DATABASE};Trusted_Connection=yes;"
+UID = "your_username"
+PWD = "your_password"
+
+CONN_STR = (
+    f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+    f"SERVER={SERVER};"
+    f"DATABASE={DATABASE};"
+    f"UID={UID};"
+    f"PWD={PWD};"
+    f"TrustServerCertificate=yes;"
+)
 
 # Create temp directory
 output_dir = os.path.join(tempfile.gettempdir(), f"{DATABASE}_procedures")
@@ -29,7 +39,6 @@ print(f"Found {len(procs)} procedures. Extracting to: {output_dir}")
 for schema_name, proc_name in procs:
     full_name = f"{schema_name}.{proc_name}"
     
-    # Get the procedure definition
     cursor.execute("""
         SELECT OBJECT_DEFINITION(OBJECT_ID(?))
     """, f"{schema_name}.{proc_name}")
@@ -38,7 +47,6 @@ for schema_name, proc_name in procs:
     definition = row[0] if row and row[0] else None
     
     if definition:
-        # Sanitize filename
         safe_name = re.sub(r'[^\w\-.]', '_', full_name)
         filepath = os.path.join(output_dir, f"{safe_name}.sql")
         
@@ -52,4 +60,4 @@ for schema_name, proc_name in procs:
 cursor.close()
 conn.close()
 print(f"\nDone. {len(procs)} procedures written to {output_dir}")
-This pulls every stored procedure's definition via OBJECT_DEFINITION() and writes each one as a .sql file into a temp directory named after the database. Encrypted procs will show as empty since their definitions aren't accessible. Schema is included in the filename (e.g., dbo.MyProc.sql).
+Key changes: switched to ODBC Driver 18 for SQL Server with UID/PWD for SQL authentication, and added TrustServerCertificate=yes; since Driver 18 enforces encryption by default and will fail without it if your server uses a self-signed cert.
